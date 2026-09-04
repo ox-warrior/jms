@@ -1,0 +1,22 @@
+/jms
+/jmsd
+/dist/
+*.test
+coverage.out
+/jmsd-admin
+
+# jmsd's own config, under any of the names it has been given. It holds the
+# access key, the Core database DSN and Core's SECRET_KEY in plaintext; only
+# jmsd.example.yaml (placeholders) belongs in the repo.
+/jmsd.yaml
+/config-jmsd.yaml
+/config-jms.yaml
+
+# 上游源码，只为核对注释里的行号引用，浅克隆自 v4.10.16 tag
+/_upstream/
+
+# 另一个项目的完整源码树（含自己的 .git），跟本仓库无关，历史原因躺在这里
+/firebase/
+
+# 设计文档与决策记录，只在内部流转
+/docs/

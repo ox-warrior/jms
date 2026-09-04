@@ -1,0 +1,24 @@
+listen: ":8391"
+core_host: "https://jumpserver.example.com"
+access_key_id: "<access_key.id>"
+access_key_secret: "<access_key.secret>"
+# Core 的 PostgreSQL，务必用只给 SELECT 权限的账号——jmsd 从不写库
+core_db_dsn: "postgres://readonly_user:pass@core-db-host:5432/jumpserver?sslmode=disable"
+secret_key: "<JumpServer Core 自己 config.txt 里的 SECRET_KEY，原样抄>"
+mfa_interval_days: 10
+
+# 日志级别："info"（默认）或 "debug"。
+# info 只记错误、写操作和少数关键事件；debug 会额外记录每次数据库查询和 Core API 调用的耗时。
+log_level: "info"
+
+# 可选。不配这一段，MFA 记录就留在进程内存里，jmsd 一重启所有人都要重验一次。
+# 配上之后 MFA 时间戳和防重放 nonce 都存进 Redis，重启不再丢。
+#
+# 不支持密码/TLS：这里假定的是一个只监听回环地址的无认证 Redis。存进去的都不是
+# 秘密（用户名、unix 时间戳、随机 nonce），但**能连上它的进程可以自己写一个
+# jmsd:mfa:<用户名>，等于替那个人跳过 MFA**。Redis 必须 bind 127.0.0.1。
+#
+# 配了但连不上 = jmsd 启动失败，不会静默退回内存。
+# redis:
+#   addr: "127.0.0.1:6379"
+#   db: 0

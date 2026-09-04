@@ -1,0 +1,50 @@
+# jms 客户端配置。放在 ~/.config/jms/config.yaml（macOS 是
+# ~/Library/Application Support/jms/config.yaml），或者用 --config 指定。
+# 除了开头两项地址，其余都可选，不写就走默认值。
+#
+# 优先级都是：命令行参数 > 这个文件 > 编译期注入的默认值。
+
+# ---- 这两项必填 ----
+#
+# 源码里没有内置默认值：任何一个默认地址都只对一套部署成立，写死在仓库里的后果
+# 是别人装完就连到你的机器上。两项缺任一，jms 会在 TUI 起来之前退出并提示改这个
+# 文件（不是进了界面再报错——那时终端已经交出去了）。
+#
+# 想要装完零配置可用，就在构建时注入，不用改源码：
+#   go build -ldflags "-X ...internal/cli.defaultServer=jumpserver.example.com \
+#                      -X ...internal/cli.defaultJmsdAddr=http://jmsd.example.com:8391" ./cmd/jms
+
+# JumpServer 的地址，jms 用它连 Koko 的 SSH 端口（端口用 --ssh-port，默认 2222）。
+# 写公网能解析的主机名，不要写内网 IP：IP 只在一个网里能通，通不了的时候报的是
+# "dial tcp <ip>:2222: i/o timeout"，看起来像 Koko 挂了而不是地址就没对过。
+server: "jumpserver.example.com"
+
+# jmsd 控制服务的地址。本机调试的 jmsd 写 http://localhost:8391。
+#
+# jmsd 自己只讲明文 HTTP（cmd/jmsd 直接 ListenAndServe，没有证书），所以 http://
+# 意味着连接票据在这一跳是明文的——内网可以接受，出了内网前面务必挂一层 TLS 代理，
+# 然后这里写 https://，jms 用系统信任库校验证书。
+jmsd_addr: "http://jmsd.example.com:8391"
+
+# 日志级别："info"（默认）或 "debug"。
+# info 只记错误和少数关键事件：登录、会话开始/结束。
+# debug 额外记录每个 jmsd 请求和 connect 每一步的耗时——排查「卡在哪一步」用这个。
+log_level: "info"
+
+# 日志文件位置。留空走默认：
+#   macOS  ~/Library/Caches/jms/jms.log
+#   Linux  ~/.cache/jms/jms.log
+# 超过 4 MiB 会截断重来，不做轮转。
+# log_file: "/tmp/jms.log"
+
+# 启动时的更新提示。默认开着——不写这一项、或者没有这个文件，都是开着的。
+# 每次启动会问一下 CDN 有没有新版，有就在 TUI 起来之前提示一次，让你选
+# 「更新并重启 / 跳过该版本 / 这次不用」。-c 快捷路径和非终端环境（管道、
+# cron）永远不提示。网络不通就静默跳过，最多为此等 2 秒。
+# disable_update_check: true
+
+# 自动更新的发布源，也就是 scripts/release.sh 上传到的那个地址。
+# 源码里没有内置默认值，所以**不配这一项就没有自动更新**——启动时不检查，
+# 也不会因此报错或写日志，只是这个功能整个不存在。
+# 指到临时桶上可以排练一次发布，不影响其他人。
+# update_url: "https://dist.example.com/jms"
