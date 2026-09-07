@@ -2,6 +2,27 @@
 
 两个二进制：`jms`（用户笔记本上的 TUI/CLI 客户端）和 `jmsd`（机房里的守护进程，持有 Core 的 API 凭据和只读库账号）。
 
+## 构建和发版走 Makefile
+
+```bash
+make check                        # gofmt + vet + test，提交前跑
+make build                        # 本机三个二进制
+make jmsd-release VERSION=0.2.0   # 机房那台的 jmsd（linux/amd64 静态链接）
+make release      VERSION=0.2.0   # jms 三平台 + 上 CDN（会覆盖生产）
+make release-dry  VERSION=0.2.0   # 同上但只编到 dist/，不碰网络
+```
+
+**别再手写 `go build`。** `internal/version.Version` 是 ldflags 注入的，源码里
+躺的是 `dev`，而 `/v1/whoami` 报的就是这个值、客户端拿它跟自己比——手编一个
+`dev` 的 jmsd 会让每个人的界面顶上都挂一条「版本不一致」，还指向错的方向。
+三个 release 目标在缺 `VERSION` 时直接失败，就是为了堵这个。
+
+**发版顺序是 jmsd 先、jms 后。** 云元数据、`cloud_key` 和 `OWNER`/
+`INSTANCE TYPE`/`MODULE` 三列全靠 jmsd 下发；反过来的话先更新的用户会拿新 jms
+连老 jmsd，`d` 面板全说「没有元数据」、三列全空。
+
+**jmsd 不进 CDN**，那套自动更新只服务用户笔记本上的 jms。
+
 ## 跑测试用 sub-agent
 
 **不要在主对话里跑 `go test ./...`。** 派一个 sub-agent 去跑，让它只回报失败，通过的包不要逐行贴回来。
