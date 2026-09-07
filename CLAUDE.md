@@ -4,6 +4,9 @@
 
 ## 构建和发版走 Makefile
 
+仓库里只有 `Makefile.example`（占位符地址），本地的 `Makefile` 是从它拷出来
+改真实桶名的，已 gitignore。没有 `Makefile` 就先 `cp Makefile.example Makefile`。
+
 ```bash
 make check                        # gofmt + vet + test，提交前跑
 make build                        # 本机三个二进制

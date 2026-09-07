@@ -221,9 +221,20 @@ scripts/release.sh 1.2.3 --build-only # 只编译到 dist/，不接触 S3，本�
 
 ## 构建
 
-统一入口是 `make`，`make help` 列出全部目标。
+统一入口是 `make`。**仓库里只有 `Makefile.example`，第一次用先拷一份**：
 
 ```bash
+cp Makefile.example Makefile
+# 编辑 Makefile 顶部的 JMS_S3_BUCKET / JMS_CDN_BASE，改成你自己的地址
+```
+
+`Makefile` 在 `.gitignore` 里，所以内部的桶名和域名不会进这个公开仓库——和
+`scripts/release.sh` 从环境变量读地址是同一个理由：仓库不写死任何一家的地址，
+别人 clone 下来不会指到你的机器上。地址没改就发版会直接失败，不会往占位符桶
+上传。
+
+```bash
+make help           # 全部目标
 make build          # 本机架构，三个二进制都编到仓库根目录
 make check          # gofmt + vet + test，提交前跑这个
 ```

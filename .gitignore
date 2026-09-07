@@ -5,6 +5,11 @@
 coverage.out
 /jmsd-admin
 
+# 本地的 Makefile：从 Makefile.example 拷出来，里面填的是真实的 S3 桶和 CDN
+# 地址。理由和下面那几个配置文件一样，也和 scripts/release.sh 从环境变量读
+# 地址一样——仓库里不写死任何一家的地址。
+/Makefile
+
 # jmsd's own config, under any of the names it has been given. It holds the
 # access key, the Core database DSN and Core's SECRET_KEY in plaintext; only
 # jmsd.example.yaml (placeholders) belongs in the repo.

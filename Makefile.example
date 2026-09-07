@@ -1,4 +1,13 @@
-# jms / jmsd 的统一入口。`make help` 列出所有目标。
+# jms / jmsd 的统一入口模板。`make help` 列出所有目标。
+#
+# 这是仓库里的公开版本，桶名和 CDN 地址是占位符。实际用的时候：
+#
+#     cp Makefile.example Makefile
+#     # 把下面 JMS_S3_BUCKET / JMS_CDN_BASE 改成真实地址
+#
+# Makefile 在 .gitignore 里，所以内部地址不会进公开仓库——这跟
+# scripts/release.sh 从环境变量读地址是同一个理由：仓库不写死任何一家的
+# 桶名和域名，别人 clone 下来不会指到你的机器上。
 #
 # 两个二进制从同一个仓库出，但走的路完全不同：
 #
@@ -19,6 +28,15 @@ LDFLAGS := -X $(MODULE)/internal/version.Version=$(VERSION)
 # 跑，不必对着目标机的 libc 试。
 JMSD_GOOS   ?= linux
 JMSD_GOARCH ?= amd64
+
+# 发布位置。改成真实地址，或者 export 同名环境变量覆盖。
+#
+# 两者必须指向同一份内容：一个用来上传，另一个既用于事后验证，也会被
+# release.sh 替换进 install.sh 的默认下载地址里——CDN 写错的话，新装的用户
+# 会从一个错的地方下载。
+JMS_S3_BUCKET ?= s3://example-dist/jms
+JMS_CDN_BASE  ?= https://dist.example.com/jms
+export JMS_S3_BUCKET JMS_CDN_BASE
 
 .DEFAULT_GOAL := help
 .PHONY: help build jms jmsd jmsd-admin jmsd-release release release-dry test test-race check fmt vet clean
@@ -73,6 +91,10 @@ jmsd-release: ## 交叉编译部署用的 jmsd（要 VERSION=x.y.z）
 release: ## 交叉编译 jms 并上传 CDN（要 VERSION=x.y.z，会覆盖生产）
 	@[ "$(VERSION)" != "dev" ] || { \
 		echo "要带版本号：make release VERSION=0.2.0" >&2; exit 1; }
+	@case "$(JMS_S3_BUCKET)" in *example-dist*) \
+		echo "JMS_S3_BUCKET 还是占位符 $(JMS_S3_BUCKET)" >&2; \
+		echo "把它和 JMS_CDN_BASE 改成真实地址（见本文件开头），再发一次" >&2; \
+		exit 1 ;; esac
 	./scripts/release.sh $(VERSION)
 
 release-dry: ## 同 release 但只编到 dist/，不碰网络
