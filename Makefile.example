@@ -36,7 +36,13 @@ JMSD_GOARCH ?= amd64
 # 会从一个错的地方下载。
 JMS_S3_BUCKET ?= s3://example-dist/jms
 JMS_CDN_BASE  ?= https://dist.example.com/jms
-export JMS_S3_BUCKET JMS_CDN_BASE
+
+# 这两个被 release.sh 替换进 install.sh，让新用户装完就有一份能直接用的配置。
+# 源码里没有内置的默认地址（任何一个都只对一套部署成立），所以不设这两个，
+# 每个人装完都得先手写配置文件才能启动。
+JMS_SERVER    ?= jumpserver.example.com
+JMS_JMSD_ADDR ?= http://jmsd.example.com:8391
+export JMS_S3_BUCKET JMS_CDN_BASE JMS_SERVER JMS_JMSD_ADDR
 
 .DEFAULT_GOAL := help
 .PHONY: help build jms jmsd jmsd-admin jmsd-release release release-dry test test-race check fmt vet clean

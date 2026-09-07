@@ -1,13 +1,19 @@
 #!/bin/bash
 #
-# jms 一键安装。发布位置来自 JMS_CDN_BASE，仓库里不写死任何一家的域名。
+# jms 一键安装。三个地址都来自环境变量，仓库里不写死任何一家的域名。
 #
-# scripts/release.sh 上传这个文件时会把 JMS_CDN_BASE 的真实值替换进默认值里，
-# 所以 CDN 上那一份 curl 下来直接能跑；仓库里这一份指向 example.com，需要
-# 自己 export JMS_CDN_BASE 再执行。
+# scripts/release.sh 上传这个文件时会把真实值替换进下面三个默认值里，所以 CDN
+# 上那一份 curl 下来直接能跑；仓库里这一份全指向 example.com，自己跑需要先
+# export 对应的变量。
+#
+# 一个文件而不是「公开版 + 内网版」两个：两份脚本必然漂移，而漂移的那一份是
+# 没人 curl 的那份，坏了也没人知道。
 set -u
 
 cdn_base="${JMS_CDN_BASE:-https://dist.example.com/jms}"
+# 写进初始配置文件的两个必填项。留空就不生成配置，用户自己照 jms.example.yaml 写。
+jms_server="${JMS_SERVER:-}"
+jms_jmsd_addr="${JMS_JMSD_ADDR:-}"
 
 base_path='/usr/local/bin'
 jms_path="$base_path/jms"
@@ -96,4 +102,38 @@ curl -fsS "$cdn_base/version" -o ~/.jms_version 2>/dev/null || true
 
 installed=$("$jms_path" version 2>/dev/null | head -1)
 echo "安装完成${installed:+：$installed}。"
-echo "首次运行前请先写好配置文件（server / jmsd_addr 必填），见 jms.example.yaml。"
+
+# 首次安装顺手写一份配置。
+#
+# server 和 jmsd_addr 是必填的，源码里没有内置默认值（任何一个默认地址都只对
+# 一套部署成立），所以在这之前每个人装完都得先手写一遍这个文件才能启动——而
+# 那两个地址是这次安装唯一知道它们的时刻。
+#
+# update_url 一起写进去，否则自动更新形同不存在：不配这一项 jms 就不检查、不
+# 报错、也不写日志，于是发出去的版本没有任何人会收到提示。
+#
+# 已有的配置一个字都不动：里面可能有人手工改过的 log_level、cache_ttl 或者
+# 指向另一套环境的地址，覆盖掉是在解决一个不存在的问题。
+config_dir="$HOME/Library/Application Support/jms"
+[ "$platform" = "linux" ] && config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/jms"
+config_path="$config_dir/config.yaml"
+
+if [ -f "$config_path" ]; then
+    echo "配置文件已存在，未改动：$config_path"
+elif [ -z "$jms_server" ] || [ -z "$jms_jmsd_addr" ]; then
+    echo "首次运行前请先写好配置文件（server / jmsd_addr 必填），见 jms.example.yaml。"
+else
+    mkdir -p "$config_dir" && cat > "$config_path" <<CONFIG
+# 由 install.sh 生成。可以随意修改，重新安装不会覆盖它。
+server: "$jms_server"
+jmsd_addr: "$jms_jmsd_addr"
+update_url: "$cdn_base"
+CONFIG
+    if [ $? -eq 0 ]; then
+        chmod 0600 "$config_path"
+        echo "配置已写入：$config_path"
+        echo "直接运行 jms 即可。"
+    else
+        echo "配置写入失败，请照 jms.example.yaml 手写一份：$config_path" >&2
+    fi
+fi

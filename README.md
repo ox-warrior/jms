@@ -169,6 +169,17 @@ macOS（arm64 / x86_64）和 Linux（x86_64）都支持，自动识别：
 ```bash
 curl -fsSL "$JMS_CDN_BASE/install.sh" | bash
 ```
+**首次安装会顺手写好配置文件**（`server` / `jmsd_addr` / `update_url`），装完直接
+`jms` 就能用。那三个地址是 `scripts/release.sh` 上传 `install.sh` 时替换进去的
+（`JMS_SERVER` / `JMS_JMSD_ADDR` / `JMS_CDN_BASE`），仓库里那一份指向
+`example.com`——公开仓库不写死任何一家的地址。
+
+**已有的配置一个字都不会动。** 重装、升级都只换二进制：那个文件里可能有人手工
+改过的 `log_level`、`cache_ttl`，或者指向另一套环境的地址。
+
+`update_url` 也在生成的配置里，因为**不配这一项自动更新就形同不存在**——jms 不
+检查、不报错、也不写日志，于是发出去的版本没有任何人会收到提示。
+
 
 `$JMS_CDN_BASE` 是你们自己的发布地址（`scripts/release.sh` 上传到的那个）。本仓库不内置任何发布源，源码里的默认值是 `https://dist.example.com/jms`——上传时 `release.sh` 会把真实地址替换进 CDN 上那一份 `install.sh`，所以从 CDN curl 下来的那份不需要设环境变量，直接跑就行。
 

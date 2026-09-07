@@ -27,6 +27,10 @@ cd "$repo_root"
 
 bucket="${JMS_S3_BUCKET:-s3://example-dist/jms}"
 cdn_base="${JMS_CDN_BASE:-https://dist.example.com/jms}"
+# 这两个被替换进 install.sh，让它首次安装时写出一份能直接用的配置。留空就是
+# 不写配置，用户装完仍需自己照 jms.example.yaml 手写一份。
+jms_server="${JMS_SERVER:-}"
+jms_jmsd_addr="${JMS_JMSD_ADDR:-}"
 dist_dir="$repo_root/dist"
 
 TARGETS=(
@@ -96,6 +100,28 @@ for t in "${TARGETS[@]}"; do
     chmod a+x "$out"
 done
 
+# 把真实地址替换进 install.sh 的默认值再上传。仓库里那一份全指向 example.com
+# （公开仓库不写死任何一家的域名），而 CDN 上这一份是给人 curl | bash 的，必须自带
+# 正确地址 —— 不能要求用户先 export 一个他还不知道的环境变量。
+sed -e "s|\${JMS_CDN_BASE:-https://dist.example.com/jms}|\${JMS_CDN_BASE:-$cdn_base}|" \
+    -e "s|\${JMS_SERVER:-}|\${JMS_SERVER:-$jms_server}|" \
+    -e "s|\${JMS_JMSD_ADDR:-}|\${JMS_JMSD_ADDR:-$jms_jmsd_addr}|" \
+    "$repo_root/scripts/install.sh" > "$dist_dir/install.sh"
+grep -q "$cdn_base" "$dist_dir/install.sh" || {
+    echo "install.sh 里的 CDN 地址没替换成功，中止上传。" >&2
+    exit 1
+}
+# server/jmsd_addr 是可选的，但设了就必须替换成功 —— 静默传上去一个不写配置的
+# install.sh，表现是「每个人装完都要手写配置」，而那正是设这两个变量要免掉的事。
+for pair in "JMS_SERVER:$jms_server" "JMS_JMSD_ADDR:$jms_jmsd_addr"; do
+    value="${pair#*:}"
+    [ -z "$value" ] && continue
+    grep -q "$value" "$dist_dir/install.sh" || {
+        echo "install.sh 里的 ${pair%%:*} 没替换成功，中止上传。" >&2
+        exit 1
+    }
+done
+
 # manifest.json 是 jms 启动时自动更新读的东西：版本号和每个目标的 sha256 必须来自
 # 同一个文件，分两次拿会出现两边描述不同构建的窗口。客户端拿不到 sha256 就拒绝更新，
 # 所以这个文件缺了不是「降级成不校验」，是「不更新」。
@@ -139,15 +165,6 @@ for t in "${TARGETS[@]}"; do
 done
 
 aws s3 cp "$dist_dir/version" "$bucket/version"
-# 把真实的 CDN 地址替换进 install.sh 的默认值再上传。仓库里那一份指向 example.com
-# （公开仓库不写死任何一家的域名），而 CDN 上这一份是给人 curl | bash 的，必须自带
-# 正确地址 —— 不能要求用户先 export 一个他还不知道的环境变量。
-sed "s|\${JMS_CDN_BASE:-https://dist.example.com/jms}|\${JMS_CDN_BASE:-$cdn_base}|" \
-    "$repo_root/scripts/install.sh" > "$dist_dir/install.sh"
-grep -q "$cdn_base" "$dist_dir/install.sh" || {
-    echo "install.sh 里的 CDN 地址没替换成功，中止上传。" >&2
-    exit 1
-}
 aws s3 cp "$dist_dir/install.sh" "$bucket/install.sh"
 
 # manifest 最后上传。它是客户端唯一的触发条件，先于二进制上去的话，已经在跑的 jms
