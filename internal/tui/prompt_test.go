@@ -583,3 +583,41 @@ func TestClickingAResultCancelsTheCommandBox(t *testing.T) {
 		t.Errorf("kind = %v, want an unrun command to have been dropped, not executed", w.kind)
 	}
 }
+
+func TestHostIsAcceptedAsAKindToken(t *testing.T) {
+	// The scope tree labels these nodes "host" -- it is JumpServer's own
+	// category name -- so ":host" is what people type after seeing it there.
+	// It used to do nothing at all: executeCommand carried its own copy of the
+	// kind vocabulary, that copy had no "host", and there was no default
+	// branch, so the screen simply did not change. "It didn't switch" and
+	// "there is no such command" look identical from the outside.
+	w, _ := newTestWorkspace(t, []ResourceRow{
+		{ID: "h1", Name: "web-01", Category: "host"},
+		{ID: "r1", Name: "cache-01", Category: "database", Type: "redis"},
+	})
+	w.changeKind(ResourceRedis)
+
+	w.executeCommand("host")
+
+	if w.kind != ResourceEC2 {
+		t.Fatalf("kind = %q after \":host\", want %q", w.kind, ResourceEC2)
+	}
+	if len(w.visible) != 1 || w.visible[0].ID != "h1" {
+		t.Fatalf("visible = %v, want just the host", w.visible)
+	}
+}
+
+func TestUnknownCommandSaysSoInsteadOfDoingNothing(t *testing.T) {
+	// Silence is the failure mode this replaces: an unrecognised command left
+	// the screen exactly as it was, which reads as a switch that failed
+	// rather than as a word that does not exist.
+	w, _ := newTestWorkspace(t, nil)
+	w.executeCommand("hsot")
+
+	if !strings.Contains(w.status, "hsot") {
+		t.Errorf("status = %q, want it to name the command", w.status)
+	}
+	if !strings.Contains(w.status, "ec2") {
+		t.Errorf("status = %q, want it to list the accepted tokens", w.status)
+	}
+}

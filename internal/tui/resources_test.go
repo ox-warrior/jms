@@ -49,11 +49,11 @@ func TestDoubleClickCopiesTheWholeValueNotWhatFitsOnScreen(t *testing.T) {
 
 	// The column decides which field: aiming at ADDRESS and getting the name
 	// back is what makes the gesture feel arbitrary.
-	w.copyCell(1, addressColumn)
-	w.copyCell(1, nameColumn)
+	w.copyCell(1, columnIndex(w.columns(), roleAddress))
+	w.copyCell(1, columnIndex(w.columns(), roleName))
 	// SOURCE TYPE holds one word from a fixed vocabulary; copying "ec2" back
 	// to yourself helps nobody, so it copies the name like the rest of the row.
-	w.copyCell(1, sourceTypeColumn)
+	w.copyCell(1, columnIndex(w.columns(), roleSourceType))
 
 	want := []string{longAddress, longName, longName}
 	if len(*copied) != len(want) {
@@ -78,7 +78,7 @@ func TestDoubleClickOnAnEmptyAddressFallsBackToTheName(t *testing.T) {
 	w, copied := copyWorkspace(t, nil)
 	w.applyResources([]ResourceRow{{ID: "1", Name: "cluster", Address: "", Category: "cloud", Type: "k8s"}})
 
-	w.copyCell(1, addressColumn)
+	w.copyCell(1, columnIndex(w.columns(), roleAddress))
 
 	if len(*copied) != 1 || (*copied)[0] != "cluster" {
 		t.Fatalf("copied %v, want the name as a fallback", *copied)
@@ -91,7 +91,7 @@ func TestDoubleClickReportsAFailedCopyAsAFailure(t *testing.T) {
 	w, _ := copyWorkspace(t, errors.New("pbcopy: not found"))
 	w.applyResources([]ResourceRow{{ID: "1", Name: "ng0", Category: "host"}})
 
-	w.copyCell(1, nameColumn)
+	w.copyCell(1, columnIndex(w.columns(), roleName))
 
 	if got := w.status; !strings.Contains(got, "copy failed") || !strings.Contains(got, "pbcopy") {
 		t.Errorf("status %q does not report the failure and its reason", got)
@@ -107,7 +107,7 @@ func TestDoubleClickOutsideTheRowsCopiesNothing(t *testing.T) {
 	w.applyResources([]ResourceRow{{ID: "1", Name: "ng0", Category: "host"}})
 
 	for _, row := range []int{0, 2, 99, -1} {
-		w.copyCell(row, nameColumn)
+		w.copyCell(row, columnIndex(w.columns(), roleName))
 	}
 	if len(*copied) != 0 {
 		t.Errorf("copied %v from rows that hold no resource", *copied)
@@ -161,17 +161,17 @@ func TestSourceTypeColumnIsRendered(t *testing.T) {
 		{ID: "d1", Name: "pg-01", Address: "10.0.0.2", Category: "database", Type: "postgresql"},
 		{ID: "k1", Name: "cluster", Address: "10.0.0.3", Category: "cloud", Type: "k8s"},
 	})
-	if got := w.table.GetCell(0, sourceTypeColumn).Text; got != "SOURCE TYPE" {
-		t.Errorf("column %d heading = %q, want SOURCE TYPE", sourceTypeColumn, got)
+	if got := w.table.GetCell(0, columnIndex(w.columns(), roleSourceType)).Text; got != "SOURCE TYPE" {
+		t.Errorf("SOURCE TYPE heading = %q", got)
 	}
 	for row, want := range map[int]string{1: "ec2", 2: "rds", 3: "k8s"} {
-		if got := w.table.GetCell(row, sourceTypeColumn).Text; got != want {
+		if got := w.table.GetCell(row, columnIndex(w.columns(), roleSourceType)).Text; got != want {
 			t.Errorf("row %d source type = %q, want %q", row, got, want)
 		}
 	}
 	// It is the last column: nothing may be rendered to its right.
-	if got := w.table.GetColumnCount(); got != sourceTypeColumn+1 {
-		t.Errorf("table has %d columns, want SOURCE TYPE last at index %d", got, sourceTypeColumn)
+	if got, want := w.table.GetColumnCount(), len(w.columns()); got != want {
+		t.Errorf("table has %d columns, want %d", got, want)
 	}
 }
 
@@ -185,7 +185,7 @@ func TestColumnCapsKeepSourceTypeVisible(t *testing.T) {
 	// ceiling.
 	const naturalName, naturalAddress = 18, 55
 	for _, width := range []int{40, 50, 60, 70, 80, 90, 100, 120, 200} {
-		nameMax, addressMax := columnCaps(width, naturalName, naturalAddress)
+		nameMax, addressMax := columnCaps(width, naturalName, naturalAddress, columnGaps+sourceTypeReserve)
 		if nameMax == 0 && addressMax == 0 {
 			// Uncapped is only correct when both columns already fit.
 			if naturalName+naturalAddress > width-columnGaps-sourceTypeReserve {
@@ -205,9 +205,9 @@ func TestColumnCapsKeepSourceTypeVisible(t *testing.T) {
 // Wide terminals must not be punished for the narrow ones: a cap where there
 // was room would truncate text for no reason.
 func TestColumnCapsLeaveRoomyTablesAlone(t *testing.T) {
-	nameMax, addressMax := columnCaps(200, 18, 55)
+	nameMax, addressMax := columnCaps(200, 18, 55, columnGaps+sourceTypeReserve)
 	if nameMax != 0 || addressMax != 0 {
-		t.Errorf("columnCaps(200, 18, 55) = (%d, %d), want no caps -- everything fits", nameMax, addressMax)
+		t.Errorf("columnCaps(200, 18, 55, columnGaps+sourceTypeReserve) = (%d, %d), want no caps -- everything fits", nameMax, addressMax)
 	}
 }
 
@@ -218,7 +218,7 @@ func TestColumnCapsShrinkAddressBeforeName(t *testing.T) {
 	// Widths here are the TABLE's inner width, not the terminal's -- the scope
 	// tree takes 30 columns before the table sees any. 55 is roughly what an
 	// 88-column terminal leaves.
-	nameMax, addressMax := columnCaps(55, 18, 55)
+	nameMax, addressMax := columnCaps(55, 18, 55, columnGaps+sourceTypeReserve)
 	if nameMax < 18 {
 		t.Errorf("name capped to %d before address hit its floor (address=%d)", nameMax, addressMax)
 	}
@@ -226,7 +226,7 @@ func TestColumnCapsShrinkAddressBeforeName(t *testing.T) {
 		t.Errorf("address = %d, want it shrunk to make room", addressMax)
 	}
 	// Narrow enough that address is already at its floor, so name must yield.
-	nameMax, addressMax = columnCaps(35, 40, 55)
+	nameMax, addressMax = columnCaps(35, 40, 55, columnGaps+sourceTypeReserve)
 	if nameMax >= 40 {
 		t.Errorf("name = %d at width 60, want it capped once address bottomed out", nameMax)
 	}
@@ -238,7 +238,7 @@ func TestColumnCapsShrinkAddressBeforeName(t *testing.T) {
 // Below both floors something has to break; SOURCE TYPE must not be it.
 func TestColumnCapsAtAbsurdWidths(t *testing.T) {
 	for _, width := range []int{0, 1, 14, 15, 20, 30} {
-		nameMax, addressMax := columnCaps(width, 40, 55)
+		nameMax, addressMax := columnCaps(width, 40, 55, columnGaps+sourceTypeReserve)
 		if addressMax < 0 || nameMax < 0 {
 			t.Errorf("width %d: negative cap (name=%d address=%d)", width, nameMax, addressMax)
 		}
@@ -286,7 +286,7 @@ func TestStarDoesNotDisturbSourceType(t *testing.T) {
 	w := starWorkspace(t)
 	w.table.Select(1, 0)
 	w.captureInput(tcell.NewEventKey(tcell.KeyRune, 'y', tcell.ModNone))
-	if got := w.table.GetCell(1, sourceTypeColumn).Text; got != "ec2" {
+	if got := w.table.GetCell(1, columnIndex(w.columns(), roleSourceType)).Text; got != "ec2" {
 		t.Errorf("source type of a starred row = %q, want ec2", got)
 	}
 }
@@ -583,5 +583,214 @@ func TestSetInitialKindEmptyIsANoOp(t *testing.T) {
 	w.SetInitialKind("")
 	if w.kind != ResourceAll {
 		t.Errorf("kind = %q after SetInitialKind(\"\"), want %q -- the ordinary launch (no \"-c\") must be untouched", w.kind, ResourceAll)
+	}
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Per-kind columns
+// ─────────────────────────────────────────────────────────────────────────────
+
+func TestInstanceTypeColumnOnlyAppearsForHosts(t *testing.T) {
+	// The kinds genuinely differ: a machine has a shape, a database has an
+	// engine. A column shown under ":all" would be blank for most rows and
+	// would take its width out of NAME and ADDRESS, which every row uses.
+	headings := func(kind ResourceKind) []string {
+		out := []string{}
+		for _, col := range activeColumns(kind) {
+			out = append(out, col.heading)
+		}
+		return out
+	}
+	want := []string{"NAME", "OWNER", "ADDRESS", "INSTANCE TYPE", "MODULE", "SOURCE TYPE"}
+	if got := headings(ResourceEC2); !slices.Equal(got, want) {
+		t.Fatalf(":ec2 columns = %v, want %v", got, want)
+	}
+	bare := []string{"NAME", "ADDRESS", "SOURCE TYPE"}
+	for _, kind := range []ResourceKind{ResourceAll, ResourceRDS, ResourceRedis, ResourceK8s} {
+		if got := headings(kind); !slices.Equal(got, bare) {
+			t.Errorf("%q columns = %v, want %v", kind, got, bare)
+		}
+	}
+}
+
+func TestInstanceTypeColumnIsRenderedUnderEC2(t *testing.T) {
+	w, _ := newTestWorkspace(t, []ResourceRow{{
+		ID: "a1", Name: "web-01", Address: "10.0.0.1", Category: "host",
+		InstanceType: "ecs.g7.large", OwnerTeam: "Platform", AppModule: "Redis",
+	}})
+	w.changeKind(ResourceEC2)
+
+	for column, want := range []struct{ heading, value string }{
+		{"NAME", "web-01"},
+		{"OWNER", "Platform"},
+		{"ADDRESS", "10.0.0.1"},
+		{"INSTANCE TYPE", "ecs.g7.large"},
+		{"MODULE", "Redis"},
+		{"SOURCE TYPE", "ec2"},
+	} {
+		if got := w.table.GetCell(0, column).Text; got != want.heading {
+			t.Errorf("column %d heading = %q, want %q", column, got, want.heading)
+		}
+		if got := w.table.GetCell(1, column).Text; got != want.value {
+			t.Errorf("column %d value = %q, want %q", column, got, want.value)
+		}
+	}
+}
+
+func TestExtraColumnsAreBlankWhenTheTagIsMissing(t *testing.T) {
+	// Application:module is on 72% of production machines, so a blank cell is
+	// the ordinary case, not a fault. It must render as empty rather than as
+	// a dash: a dash in a column that is usually filled reads as data that
+	// failed to load.
+	w, _ := newTestWorkspace(t, []ResourceRow{
+		{ID: "a1", Name: "web-01", Category: "host", InstanceType: "m5.large"},
+	})
+	w.changeKind(ResourceEC2)
+
+	module := columnIndex(w.columns(), roleExtra) // first extra; find MODULE by heading
+	for i, col := range w.columns() {
+		if col.heading == "MODULE" {
+			module = i
+		}
+	}
+	if got := w.table.GetCell(1, module).Text; got != "" {
+		t.Errorf("missing module rendered as %q, want empty", got)
+	}
+}
+
+func TestColumnWidthsNeverOverflowTheTable(t *testing.T) {
+	// tview lays columns out left to right and discards what does not fit, so
+	// overflowing costs the LAST column -- SOURCE TYPE, which this package
+	// already has a regression test for losing. The allocation has to stay
+	// inside the table at every width worth drawing at.
+	for _, kind := range []ResourceKind{ResourceAll, ResourceEC2} {
+		cols := activeColumns(kind)
+		for _, width := range []int{60, 70, 80, 100, 120, 140, 200} {
+			caps := columnWidths(cols, width, 40, 55)
+
+			used := len(cols) // the cell tview charges between columns
+			for i, col := range cols {
+				if caps[i] < 0 {
+					t.Fatalf("%s at %d cols: column %q has a negative cap", kind, width, col.heading)
+				}
+				if caps[i] > 0 {
+					used += caps[i]
+				} else {
+					used += col.reserve // uncapped: it gets its full reserve
+				}
+			}
+			if used > width {
+				t.Errorf("%s at %d cols: columns total %d cells", kind, width, used)
+			}
+		}
+	}
+}
+
+func TestExtraColumnsYieldBeforeNameAndAddressDo(t *testing.T) {
+	// A cap of 0 means "no cap", so there is no way to express a dropped
+	// column -- the policy is about who gets SQUEEZED first, and it is the
+	// per-kind columns: NAME and ADDRESS are in every row and are what a row
+	// gets picked by.
+	cols := activeColumns(ResourceEC2)
+	nameAt := columnIndex(cols, roleName)
+
+	for i, col := range columnWidths(cols, 200, 30, 55) {
+		if cols[i].role == roleExtra && col != 0 {
+			t.Errorf("%q was capped to %d cells in a 200-cell table", cols[i].heading, col)
+		}
+	}
+
+	tight := columnWidths(cols, 50, 30, 55)
+	squeezed := 0
+	for i, col := range cols {
+		if col.role == roleExtra && tight[i] > 0 && tight[i] < col.reserve {
+			squeezed++
+		}
+	}
+	if squeezed == 0 {
+		t.Errorf("nothing gave way in a 50-cell table: %v", tight)
+	}
+	if tight[nameAt] < nameFloor {
+		t.Errorf("NAME was squeezed to %d, below its floor of %d, while extras still had room",
+			tight[nameAt], nameFloor)
+	}
+}
+
+func TestSourceTypeReserveIsNeverSpentOnSomethingElse(t *testing.T) {
+	// SOURCE TYPE is the last column, so it is what tview discards first --
+	// which is the bug TestSourceTypeSurvivesNarrowTerminal exists for. Its
+	// reserve comes off the top, before anything else is allocated.
+	cols := activeColumns(ResourceEC2)
+	at := columnIndex(cols, roleSourceType)
+
+	for _, width := range []int{40, 60, 80, 200} {
+		caps := columnWidths(cols, width, 40, 55)
+		if caps[at] != 0 {
+			t.Errorf("%d cols: SOURCE TYPE was capped to %d instead of keeping its reserve", width, caps[at])
+		}
+	}
+}
+
+func TestSearchCoversEveryColumnTheKindShows(t *testing.T) {
+	// The columns are there to be scanned, so they have to be searchable --
+	// finding "the Kafka boxes" or "everything Payments owns" is the whole
+	// reason those columns exist.
+	w, _ := newTestWorkspace(t, []ResourceRow{
+		{ID: "a", Name: "web-01", Address: "10.0.0.1", Category: "host",
+			InstanceType: "ecs.g7.large", OwnerTeam: "Platform", AppModule: "Redis"},
+		{ID: "b", Name: "api-02", Address: "10.0.0.2", Category: "host",
+			InstanceType: "m5.2xlarge", OwnerTeam: "Payments", AppModule: "Kafka"},
+	})
+	w.changeKind(ResourceEC2)
+
+	for _, probe := range []struct{ query, wantID string }{
+		{"web-01", "a"},   // NAME
+		{"10.0.0.2", "b"}, // ADDRESS
+		{"payments", "b"}, // OWNER, case-insensitively
+		{"m5.2xl", "b"},   // INSTANCE TYPE
+		{"kafka", "b"},    // MODULE
+	} {
+		w.filterCurrent(probe.query)
+		if len(w.visible) != 1 || w.visible[0].ID != probe.wantID {
+			t.Errorf("search %q matched %d rows, want just %q", probe.query, len(w.visible), probe.wantID)
+		}
+	}
+}
+
+func TestSearchIgnoresColumnsTheKindDoesNotShow(t *testing.T) {
+	// Under ":all" there is no OWNER column, so a row matching only on the
+	// owning team would appear with nothing on screen explaining why -- which
+	// looks exactly like a broken filter.
+	w, _ := newTestWorkspace(t, []ResourceRow{
+		{ID: "a", Name: "web-01", Category: "host", OwnerTeam: "Platform"},
+	})
+	w.changeKind(ResourceAll)
+
+	w.filterCurrent("platform")
+	if len(w.visible) != 0 {
+		t.Errorf("matched on a hidden column: %v", w.visible)
+	}
+}
+
+func TestSearchDoesNotDependOnTerminalWidth(t *testing.T) {
+	// Columns are dropped when a window is too narrow (activeColumns), but
+	// search must not follow: resizing a terminal and watching the match
+	// count change would be inexplicable.
+	rows := []ResourceRow{
+		{ID: "a", Name: "web-01", Category: "host", AppModule: "Kafka"},
+	}
+	wide, _ := newTestWorkspace(t, rows)
+	wide.changeKind(ResourceEC2)
+	wide.fitColumns(200)
+	wide.filterCurrent("kafka")
+
+	narrow, _ := newTestWorkspace(t, rows)
+	narrow.changeKind(ResourceEC2)
+	narrow.fitColumns(40) // far too narrow for MODULE to survive
+	narrow.filterCurrent("kafka")
+
+	if len(wide.visible) != len(narrow.visible) {
+		t.Fatalf("wide matched %d rows, narrow matched %d -- width changed the results",
+			len(wide.visible), len(narrow.visible))
 	}
 }

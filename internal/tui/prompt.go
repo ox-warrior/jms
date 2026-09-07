@@ -9,6 +9,8 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+
+	"github.com/leiyupeng/jumpserver-cli/internal/jmsd"
 )
 
 // The two command-line prompts. They are deliberately different symbols
@@ -53,8 +55,8 @@ const (
 // what makes a committed filter visible, and it names the key that clears it.
 func (w *Workspace) renderFooter() {
 	key := tag(theme.Accent) + "[::b]"
-	text := fmt.Sprintf(" %s:[-:-:-] resource   %s/[-:-:-] filter   %sTab[-:-:-] focus   %sEnter[-:-:-] open   %sy[-:-:-] star   %sr[-:-:-] refresh   %sEsc[-:-:-] clear",
-		key, key, key, key, key, key, key)
+	text := fmt.Sprintf(" %s:[-:-:-] resource   %s/[-:-:-] filter   %sTab[-:-:-] focus   %sEnter[-:-:-] open   %sd[-:-:-] describe   %sy[-:-:-] star   %sr[-:-:-] refresh   %sEsc[-:-:-] clear",
+		key, key, key, key, key, key, key, key)
 	if w.searchQuery != "" {
 		text += fmt.Sprintf("   %s[::b]/%s[-:-:-] %s(%d/%d)[-]",
 			tag(theme.Warn), tview.Escape(w.searchQuery),
@@ -93,6 +95,9 @@ func (w *Workspace) captureInput(event *tcell.EventKey) *tcell.EventKey {
 			return nil
 		case 'y':
 			w.toggleFavorite()
+			return nil
+		case 'd':
+			w.describeSelected()
 			return nil
 		case 'j':
 			return tcell.NewEventKey(tcell.KeyDown, 0, tcell.ModNone)
@@ -223,18 +228,22 @@ func (w *Workspace) finishCommand(key tcell.Key) {
 	w.applyFocus()
 }
 
+// executeCommand runs a ":" command.
+//
+// Resource kinds go through jmsd.ParseResourceKind rather than a switch of
+// their own. The switch was a second copy of that vocabulary and the two had
+// already drifted: the scope tree labels its nodes "host", so ":host" is what
+// people type, and it silently did nothing -- there was no default branch, so
+// an unrecognised command left the screen exactly as it was. "It didn't
+// switch" and "there is no such command" look identical from the outside, and
+// the second one is the answer.
 func (w *Workspace) executeCommand(command string) {
-	switch strings.ToLower(command) {
-	case "all":
-		w.changeKind(ResourceAll)
-	case "ec2":
-		w.changeKind(ResourceEC2)
-	case "rds":
-		w.changeKind(ResourceRDS)
-	case "redis":
-		w.changeKind(ResourceRedis)
-	case "k8s", "kubernetes":
-		w.changeKind(ResourceK8s)
+	command = strings.ToLower(strings.TrimSpace(command))
+	if kind, ok := jmsd.ParseResourceKind(command); ok {
+		w.changeKind(kind)
+		return
+	}
+	switch command {
 	case "q", "quit", "exit":
 		// Exactly what Ctrl+C does: tview's event loop calls Stop() on it
 		// (application.go, "Ctrl-C closes the application"), and Run returns,
@@ -242,5 +251,11 @@ func (w *Workspace) executeCommand(command string) {
 		// having because ":" is already where this client is driven from, and
 		// ":q" is the reflex anyone arriving from vim or k9s brings with them.
 		w.app.Stop()
+	case "":
+		// Enter on an empty prompt is a cancel, not a mistake.
+	default:
+		w.setStatus(w.username, statusFailed,
+			fmt.Sprintf("unknown command %q · try %s", tview.Escape(command),
+				strings.Join(jmsd.ResourceKindTokens(), " / ")))
 	}
 }

@@ -7,6 +7,12 @@
 //   - resources.go  -- the asset table: what is shown, and how wide
 //   - scopetree.go  -- the left-hand tree and what each node contains
 //   - prompt.go     -- the ":" and "/" input box, and the keys around it
+//
+// The "d" panel is a view of its own rather than part of the workspace, and
+// splits the same way:
+//
+//   - describe.go     -- the view: its keys, its search box, its clipboard
+//   - describetext.go -- HostInfo to text, all pure functions
 
 package tui
 
@@ -16,6 +22,8 @@ import (
 
 	"github.com/gdamore/tcell/v2"
 	"github.com/rivo/tview"
+
+	"github.com/leiyupeng/jumpserver-cli/internal/jmsd"
 )
 
 // ResourceQuery identifies one generation of the loaded collection. It
@@ -46,6 +54,14 @@ type ResourceSelection struct {
 type WorkspaceActions struct {
 	Load         func(query ResourceQuery)
 	OpenResource func(selection ResourceSelection)
+	// Describe fetches and shows the selected machine's cloud metadata ("d").
+	// Optional -- nil makes the key a no-op rather than an error, which is
+	// what keeps the workspace tests from needing a jmsd.
+	Describe func(selection ResourceSelection)
+	// ShowDescribe opens the panel with metadata already in hand, for the row
+	// whose listing said it has none. Separate from Describe so that answer
+	// costs no request.
+	ShowDescribe func(resource ResourceRow, host *jmsd.HostInfo)
 	// SetFavorite records a star change with jmsd, which writes it to Core so
 	// it is shared with the web console. Called after the UI has already
 	// updated optimistically; report failure by calling back into
@@ -286,7 +302,7 @@ func (w *Workspace) copyCell(row, column int) {
 	}
 	resource := w.visible[row-1]
 	value := resource.Name
-	if column == addressColumn && resource.Address != "" {
+	if column == columnIndex(w.columns(), roleAddress) && resource.Address != "" {
 		value = resource.Address
 	}
 	if err := w.actions.CopyName(value); err != nil {
@@ -369,19 +385,30 @@ func (w *Workspace) setStatus(username string, level statusLevel, status string)
 	w.header.SetText(header)
 }
 
-// QueueLoadResult is the worker-safe result boundary. Stale generations are
-// discarded before any tview primitive is mutated.
-func (w *Workspace) QueueLoadResult(query ResourceQuery, rows []ResourceRow, username string, level statusLevel, status string) {
-	rows = append([]ResourceRow(nil), rows...)
-	w.app.QueueUpdateDraw(func() { w.applyLoadResult(query, rows, username, level, status) })
-}
-
-func (w *Workspace) applyLoadResult(query ResourceQuery, rows []ResourceRow, username string, level statusLevel, status string) {
+// ApplyLoad installs a tree and its assets together. Must run on the tview
+// goroutine; the caller owns the queueing, so it can put the workspace on
+// screen in the SAME update (see UI.applyWorkspaceLoad).
+//
+// Together is the point. Installed separately the tree went in while
+// w.resources was still empty, so every node scored zero matches and rendered
+// in its nothing-here state, and only the next frame showed the real tree --
+// and the counts are computed from the assets precisely so the two agree,
+// which they cannot do a frame apart.
+//
+// Reports whether it applied: a result from a superseded generation is
+// dropped, and the caller must not reveal anything on the strength of it.
+func (w *Workspace) ApplyLoad(query ResourceQuery, nodes []ScopeNode, rows []ResourceRow, username string, level statusLevel, status string) bool {
 	if query.Generation != w.generation {
-		return
+		return false
 	}
-	w.applyResources(rows)
+	// Assets first: setScopeNodes rebuilds the tree, and the per-node counts
+	// it renders come from w.resources.
+	if nodes != nil {
+		w.applyResources(rows)
+		w.setScopeNodes(cloneScopeNodes(nodes))
+	}
 	w.setStatus(username, level, status)
+	return true
 }
 
 // openSelectedResource is the Enter-key action on the resources table. It

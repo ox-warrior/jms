@@ -9,11 +9,19 @@ import (
 	"github.com/jumpserver-dev/sdk-go/service"
 )
 
-// permAssetPageSize matches what sdk-go's own getPaginationAssets uses. Core
-// caps a page at MAX_PAGE_SIZE=1000 (apps/jumpserver/conf.py:702); staying at
-// 100 keeps each response small and mirrors the pagination the rest of the
-// codebase already exercises against this endpoint.
-const permAssetPageSize = 100
+// permAssetPageSize is how many assets one page of the crawl below asks for.
+//
+// Core caps a page at MAX_PAGE_SIZE=1000 (apps/jumpserver/conf.py:702). This
+// used to be 100, copied from sdk-go's own getPaginationAssets, and the cost
+// of that showed up as soon as it was timed: a production listing of 554
+// assets took six sequential round trips at ~330ms each, about 2s of the
+// launch, and the pages are sequential by construction -- Core hands back the
+// next page's URL in the current page's body, so there is nothing to fan out.
+//
+// The 330ms is almost entirely fixed cost, not transfer: the last page, with
+// 54 rows on it, took the same as the full ones. So fewer, larger pages is
+// very nearly free, and 500 turns that listing into two round trips.
+const permAssetPageSize = 500
 
 // permAssetMaxPages bounds the crawl below. Core paginates by echoing a `next`
 // URL back, and the loop's only exit is that field going empty -- so a Core
@@ -42,8 +50,14 @@ type permAsset struct {
 	Name     string           `json:"name"`
 	Address  string           `json:"address"`
 	Category model.LabelField `json:"category"`
-	Type     model.LabelField `json:"type"`
-	Nodes    []permAssetNode  `json:"nodes"`
+	// Comment is where cloud-sync stamps "[cloud-sync:{provider}:{account}:
+	// {source_id}]", the only thing joining an asset to its cloud metadata.
+	// Free to ask for: it is already in the serializer's only_fields
+	// (v4.10.16 apps/perms/serializers/user_permission.py:35), so the
+	// response carried it before and this just stops discarding it.
+	Comment string           `json:"comment"`
+	Type    model.LabelField `json:"type"`
+	Nodes   []permAssetNode  `json:"nodes"`
 }
 
 // permAssetNode is the trimmed node reference embedded in each asset. Only the

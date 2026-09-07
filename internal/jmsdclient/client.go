@@ -176,6 +176,13 @@ func (c *Client) AssetDetail(ctx context.Context, assetID string) (jmsd.AssetDet
 	return get[jmsd.AssetDetail](ctx, c, "/v1/assets/detail", url.Values{"asset": {assetID}})
 }
 
+// Describe fetches one machine's cloud metadata (GET /v1/assets/describe).
+// key comes from AssetRow.CloudKey; an empty key has no metadata and must not
+// be sent.
+func (c *Client) Describe(ctx context.Context, key string) (jmsd.HostInfo, error) {
+	return get[jmsd.HostInfo](ctx, c, "/v1/assets/describe", url.Values{"key": {key}})
+}
+
 // Connect mints a connection ticket for one asset+account+protocol
 // (POST /v1/connections). The signature binds asset|account|protocol, in
 // that order, matching jmsd.Server.handleConnections exactly -- like

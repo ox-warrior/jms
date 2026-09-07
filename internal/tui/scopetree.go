@@ -28,12 +28,6 @@ type ScopeNode struct {
 	Children []ScopeNode
 }
 
-// QueueScopeNodes safely applies API-owned nodes from a worker goroutine.
-func (w *Workspace) QueueScopeNodes(nodes []ScopeNode) {
-	nodes = cloneScopeNodes(nodes)
-	w.app.QueueUpdateDraw(func() { w.setScopeNodes(nodes) })
-}
-
 // setScopeNodes installs a freshly-fetched permission tree. The nodes are
 // retained so rebuildScopeTree can re-render them as the filter changes.
 func (w *Workspace) setScopeNodes(nodes []ScopeNode) {
@@ -135,9 +129,15 @@ func subtreeMatches(nodes []ScopeNode, resources []ResourceRow, kind ResourceKin
 func subtreeAssetIDs(nodes []ScopeNode, resources []ResourceRow, kind ResourceKind, query string) map[string]map[string]struct{} {
 	query = strings.ToLower(strings.TrimSpace(query))
 
+	// The same set the table matches on (see matching), so a node's count and
+	// the rows it opens to are decided by identical criteria -- a tree
+	// counting on more columns than the table matches on would advertise rows
+	// that are not there.
+	cols := activeColumns(kind)
+
 	byNode := make(map[string][]string)
 	for _, resource := range resources {
-		if !matchesFilter(resource, kind, query) {
+		if !matchesFilter(resource, kind, query, cols) {
 			continue
 		}
 		for _, nodeID := range resource.NodeIDs {

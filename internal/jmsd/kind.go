@@ -66,6 +66,11 @@ var resourceKindTokens = []struct {
 }{
 	{token: "all", kind: ResourceAll},
 	{token: "ec2", kind: ResourceEC2},
+	// The scope tree labels these nodes "host" (it is JumpServer's own
+	// category name), so that is what people type. Accepted but not
+	// advertised: ":ec2" stays the name in the footer, and one canonical
+	// spelling per kind keeps the hint line short.
+	{token: "host", kind: ResourceEC2, alias: true},
 	{token: "rds", kind: ResourceRDS},
 	{token: "redis", kind: ResourceRedis},
 	{token: "k8s", kind: ResourceK8s},

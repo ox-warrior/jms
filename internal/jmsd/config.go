@@ -50,6 +50,16 @@ type Config struct {
 	// docs/PLAN.md §7.2. Format:
 	// "postgres://user:pass@host:5432/jumpserver?sslmode=disable".
 	CoreDBDSN string `yaml:"core_db_dsn"`
+	// InventoryDBDSN points at the MySQL holding cloud-sync's
+	// cloud_instance_info table, which jmsd reads (never writes) to answer
+	// "describe". Optional: left empty, describe reports that it is not
+	// configured and everything else works as before.
+	//
+	// Must carry parseTime=true&loc=UTC -- the DATETIME columns hold UTC with
+	// no zone of their own, and without loc every timestamp shown would be
+	// off by the server's offset. Format:
+	// "user:pass@tcp(host:3306)/cloud_meta?parseTime=true&loc=UTC".
+	InventoryDBDSN string `yaml:"inventory_db_dsn"`
 	// SecretKey is Core's Django SECRET_KEY, copied verbatim from Core's own
 	// config.txt. It decrypts the EncryptField columns jmsd reads.
 	SecretKey string `yaml:"secret_key"`

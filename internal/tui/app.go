@@ -44,6 +44,13 @@ type UI struct {
 	opts      Options
 	attemptMu sync.Mutex
 	attemptID uint64
+	// describeMu/describeGen invalidate an in-flight describe. Bumped by
+	// every "d" and by closing the panel, so a slow answer can neither
+	// overwrite a newer one nor reopen a panel the user has dismissed --
+	// AddPage replaces a same-named page silently, so both would read as the
+	// panel acting on its own.
+	describeMu  sync.Mutex
+	describeGen uint64
 	// connectingPhase is the connecting modal's middle line, held here so a
 	// slow connect can say which step it is on without rebuilding the modal.
 	// Only ever touched on the tview goroutine (showConnecting, hideConnecting,
@@ -57,9 +64,24 @@ type UI struct {
 	workspace *Workspace
 }
 
+// DefaultKind is the resource kind jms opens on when "-c" does not name one.
+//
+// Machines are what people come here for, and ":ec2" is the only view with the
+// per-kind columns, so opening on it puts them in front of the user instead of
+// behind a command they have to know about. ":all" is one keystroke away.
+//
+// Set here rather than as the Workspace's own initial kind: the workspace
+// defaults to ":all" -- "everything I am permitted", which is the honest
+// default for the type itself -- and this is a product decision about the
+// launch, the same layer "-c" already lives at.
+const DefaultKind = ResourceEC2
+
 func Run(opts Options) error {
 	if opts.Theme == "" {
 		opts.Theme = DefaultTheme
+	}
+	if opts.InitialKind == "" {
+		opts.InitialKind = DefaultKind
 	}
 	resolved, err := resolveTheme(opts.Theme)
 	if err != nil {
@@ -194,7 +216,32 @@ func (u *UI) identify(attemptID uint64, message, hint *tview.TextView) {
 		if !u.isCurrentAttempt(attemptID) {
 			return
 		}
-		u.pages.AddAndSwitchToPage("resources", u.resourcePage(username, jc, endpoints, hostKey, notice), true)
+		// Built and started loading, but NOT switched to. An empty workspace
+		// shown while its own data is still in flight is a frame of blank
+		// tree and blank table that then changes under the reader -- the
+		// launch flicker. The starting screen says what is happening instead,
+		// and applyWorkspaceLoad reveals a workspace that already has its
+		// contents.
+		u.pages.AddPage(resourcesPage, u.resourcePage(username, jc, endpoints, hostKey, notice), true, false)
+		message.SetText(tag(theme.Warn) + "Loading assets…[-]")
+	})
+}
+
+// applyWorkspaceLoad puts a load result on screen: the tree, the assets and,
+// the first time, the workspace itself -- all in one update, so the user's
+// first sight of it is already populated.
+func (u *UI) applyWorkspaceLoad(workspace *Workspace, query ResourceQuery, nodes []ScopeNode, rows []ResourceRow, username string, level statusLevel, status string) {
+	u.app.QueueUpdateDraw(func() {
+		if !workspace.ApplyLoad(query, nodes, rows, username, level, status) {
+			return
+		}
+		// Also on the failure path (nodes nil): a workspace that never
+		// appears leaves the user staring at "Loading assets…" with the
+		// reason sitting in a status line they cannot see.
+		if name, _ := u.pages.GetFrontPage(); name != resourcesPage {
+			u.pages.SwitchToPage(resourcesPage)
+			workspace.applyFocus()
+		}
 	})
 }
 
@@ -265,6 +312,22 @@ func (u *UI) resourcePage(username string, jc *jmsdclient.Client, endpoints conf
 		OpenResource: func(selection ResourceSelection) {
 			go u.connectResource(selection, username, jc, endpoints, hostKey, workspace)
 		},
+		ShowDescribe: func(resource ResourceRow, host *jmsd.HostInfo) {
+			// Bumped even though nothing is fetched. Without it, a request
+			// still in flight from a PREVIOUS "d" stays current and lands on
+			// top of this panel -- so pressing "d" on a machine with no
+			// metadata, right after pressing it on one that has some, showed
+			// the earlier machine's data under this row's title.
+			u.nextDescribe()
+			u.showDescribe(resource, host, clipboard.Copy)
+		},
+		Describe: func(selection ResourceSelection) {
+			// Bumped here rather than inside describeResource: this runs on
+			// the tview goroutine, so two quick presses get their generations
+			// in press order. Bumping on the spawned goroutine would let them
+			// race and leave the older request holding the newer generation.
+			go u.describeResource(u.nextDescribe(), selection, username, jc, workspace)
+		},
 		SetFavorite: func(assetID string, starred bool) {
 			go u.setFavorite(assetID, starred, username, jc, workspace)
 		},
@@ -300,9 +363,8 @@ func (u *UI) resourcePage(username string, jc *jmsdclient.Client, endpoints conf
 func (u *UI) loadWorkspace(query ResourceQuery, username string, jc *jmsdclient.Client, workspace *Workspace) {
 	if !query.Refresh {
 		if entry := assetcache.Load(u.cacheKey(), username, u.opts.CacheTTL); entry != nil {
-			workspace.QueueScopeNodes(convertScopeNodes(entry.Nodes))
-			workspace.QueueLoadResult(query, convertResourceRows(entry.Assets), username, statusOK,
-				fmt.Sprintf("ready · cached %s ago", entry.Age().Round(time.Minute)))
+			u.applyWorkspaceLoad(workspace, query, convertScopeNodes(entry.Nodes), convertResourceRows(entry.Assets),
+				username, statusOK, fmt.Sprintf("ready · cached %s ago", entry.Age().Round(time.Minute)))
 			return
 		}
 	}
@@ -312,13 +374,13 @@ func (u *UI) loadWorkspace(query ResourceQuery, username string, jc *jmsdclient.
 	nodes, err := connectflow.WithMFA(gate, func() ([]jmsd.NodeTree, error) { return jc.Nodes(ctx) })
 	if err != nil {
 		jmslog.Printf("workspace: load nodes: %v", err)
-		workspace.QueueLoadResult(query, nil, username, statusFailed, "load scope failed: "+tview.Escape(err.Error()))
+		u.applyWorkspaceLoad(workspace, query, nil, nil, username, statusFailed, "load scope failed: "+tview.Escape(err.Error()))
 		return
 	}
 	assets, err := connectflow.WithMFA(gate, func() ([]jmsd.AssetRow, error) { return jc.Assets(ctx) })
 	if err != nil {
 		jmslog.Printf("workspace: load assets: %v", err)
-		workspace.QueueLoadResult(query, nil, username, statusFailed, "load failed: "+tview.Escape(err.Error()))
+		u.applyWorkspaceLoad(workspace, query, nil, nil, username, statusFailed, "load failed: "+tview.Escape(err.Error()))
 		return
 	}
 	jmslog.Debugf("workspace: loaded %d nodes, %d assets from jmsd (refresh=%t)", len(nodes), len(assets), query.Refresh)
@@ -330,8 +392,7 @@ func (u *UI) loadWorkspace(query ResourceQuery, username string, jc *jmsdclient.
 		jmslog.Printf("asset cache: write failed: %v", err)
 		level, status = statusFailed, "ready · cache write failed: "+tview.Escape(err.Error())
 	}
-	workspace.QueueScopeNodes(convertScopeNodes(nodes))
-	workspace.QueueLoadResult(query, convertResourceRows(assets), username, level, status)
+	u.applyWorkspaceLoad(workspace, query, convertScopeNodes(nodes), convertResourceRows(assets), username, level, status)
 }
 
 // loadMarks fetches the caller's starred and recently-connected assets. Both
@@ -376,12 +437,16 @@ func convertResourceRows(assets []jmsd.AssetRow) []ResourceRow {
 	out := make([]ResourceRow, 0, len(assets))
 	for _, a := range assets {
 		out = append(out, ResourceRow{
-			ID:       a.ID,
-			Name:     a.Name,
-			Address:  a.Address,
-			Category: a.Category,
-			Type:     a.Type,
-			NodeIDs:  a.NodeIDs,
+			ID:           a.ID,
+			Name:         a.Name,
+			Address:      a.Address,
+			CloudKey:     a.CloudKey,
+			InstanceType: a.InstanceType,
+			OwnerTeam:    a.OwnerTeam,
+			AppModule:    a.AppModule,
+			Category:     a.Category,
+			Type:         a.Type,
+			NodeIDs:      a.NodeIDs,
 		})
 	}
 	return out

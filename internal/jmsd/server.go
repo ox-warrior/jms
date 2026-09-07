@@ -28,6 +28,10 @@ type Server struct {
 	cfg    Config
 	core   *service.JMService
 	coreDB *CoreDB
+	// inventory is the cloud-metadata database, nil when inventory_db_dsn is
+	// unset. Only handleAssetDescribe touches it, and it checks for nil --
+	// this is a display feature and must never be able to break a connection.
+	inventory *InventoryDB
 	// users resolves a caller's key fingerprint to a JumpServer user from a
 	// cached index, so an unauthenticated caller cannot drive Core's database
 	// by sending forged signatures -- see userDirectory.
@@ -55,6 +59,28 @@ type AssetRow struct {
 	// tally per-node match counts without asking Core per node. It lists only
 	// direct parents, never ancestors -- see permAsset in permassets.go.
 	NodeIDs []string `json:"node_ids"`
+	// CloudKey addresses this asset's row in the cloud-metadata table, and is
+	// what GET /v1/assets/describe takes. Empty means there is nothing to
+	// show -- either the asset is not cloud-sync managed, or no inventory
+	// database is configured -- which lets the client answer "d" without a
+	// round-trip when the answer is "nothing".
+	//
+	// Only a key travels, not the whole row: the rows are a few hundred bytes
+	// each and most are never looked at, so attaching them all would spend
+	// hundreds of kilobytes per listing on a panel opened a few times a day.
+	CloudKey string `json:"cloud_key,omitempty"`
+	// InstanceType is the machine's shape, shown as a column in the client's
+	// resource table. Only hosts have one.
+	//
+	// It is here rather than behind CloudKey because it is worth seeing while
+	// scanning a list, which is the whole bar for adding a field to this
+	// struct -- see jmsd.cloudBrief.
+	InstanceType string `json:"instance_type,omitempty"`
+	// OwnerTeam and AppModule are the other two listing-visible cloud fields,
+	// shown as columns beside InstanceType. Same bar as above: short, single
+	// value, worth seeing while scanning.
+	OwnerTeam string `json:"owner_team,omitempty"`
+	AppModule string `json:"app_module,omitempty"`
 }
 
 // authedHandler is an HTTP handler that only runs after requireSignature has
@@ -125,10 +151,35 @@ func New(cfg Config) (*Server, error) {
 	} else {
 		log.Printf("jmsd: auth state in %s, every restart re-prompts MFA (set redis.addr to persist it)", stateDesc)
 	}
+	// Opened eagerly, like coreDB, so a wrong DSN surfaces at startup rather
+	// than the first time somebody presses "d". Fatal on purpose: the admin
+	// asked for this by setting the key, and a daemon that silently drops a
+	// configured feature is worse than one that refuses to start.
+	var inv *InventoryDB
+	if cfg.InventoryDBDSN != "" {
+		if inv, err = NewInventoryDB(cfg.InventoryDBDSN); err != nil {
+			_ = coreDB.Close()
+			_ = state.Close()
+			return nil, err
+		}
+		// Loaded here, not on the first request. The table lives in another
+		// region; paying seconds for it at startup costs nobody anything,
+		// while paying it on demand would land on whoever opens jms first --
+		// which, with a TTL shorter than the gap between launches, is very
+		// nearly everybody.
+		if err := inv.Warm(); err != nil {
+			log.Printf("jmsd: cloud metadata configured but the first load failed, retrying in the background: %v", err)
+		} else {
+			log.Printf("jmsd: cloud metadata loaded, assets carry it for the \"d\" panel")
+		}
+	} else {
+		log.Printf("jmsd: no inventory_db_dsn, the \"d\" panel will report no cloud metadata")
+	}
 	return &Server{
 		cfg:         cfg,
 		core:        core,
 		coreDB:      coreDB,
+		inventory:   inv,
 		users:       newUserDirectory(coreDB.activeSSHKeys, keyIndexTTL),
 		mfaFailures: newFailureTracker(mfaMaxFailures, mfaLockout),
 		state:       state,
@@ -140,7 +191,11 @@ func New(cfg Config) (*Server, error) {
 // client holds no closeable resources. Both are attempted even if the first
 // fails, since leaving one open helps nobody.
 func (s *Server) Close() error {
-	return errors.Join(s.coreDB.Close(), s.state.Close())
+	err := errors.Join(s.coreDB.Close(), s.state.Close())
+	if s.inventory != nil {
+		err = errors.Join(err, s.inventory.Close())
+	}
+	return err
 }
 
 func (s *Server) Handler() http.Handler {
@@ -150,6 +205,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/nodes", s.requireSignature(s.handleNodes))
 	mux.HandleFunc("/v1/assets", s.requireSignature(s.handleAssets))
 	mux.HandleFunc("/v1/assets/detail", s.requireSignature(s.handleAssetDetail))
+	mux.HandleFunc("/v1/assets/describe", s.requireSignature(s.handleDescribe))
 	mux.HandleFunc("/v1/marks", s.requireSignature(s.handleMarks))
 	mux.HandleFunc("/v1/auth/mfa", s.handleMFA)
 	mux.HandleFunc("/v1/favorites", s.handleSetFavorite)
@@ -589,6 +645,7 @@ func (s *Server) handleAssets(w http.ResponseWriter, r *http.Request, user *user
 		return
 	}
 
+	briefs := s.inventory.briefs(assets)
 	rows := make([]AssetRow, 0, len(assets))
 	for _, a := range assets {
 		nodeIDs := make([]string, 0, len(a.Nodes))
@@ -596,12 +653,16 @@ func (s *Server) handleAssets(w http.ResponseWriter, r *http.Request, user *user
 			nodeIDs = append(nodeIDs, n.ID)
 		}
 		rows = append(rows, AssetRow{
-			ID:       a.ID,
-			Name:     a.Name,
-			Address:  a.Address,
-			Category: string(a.Category),
-			Type:     string(a.Type),
-			NodeIDs:  nodeIDs,
+			ID:           a.ID,
+			Name:         a.Name,
+			Address:      a.Address,
+			Category:     string(a.Category),
+			Type:         string(a.Type),
+			NodeIDs:      nodeIDs,
+			CloudKey:     briefs[a.ID].Key,
+			InstanceType: briefs[a.ID].InstanceType,
+			OwnerTeam:    briefs[a.ID].OwnerTeam,
+			AppModule:    briefs[a.ID].AppModule,
 		})
 	}
 	writeJSON(w, rows)

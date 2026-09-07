@@ -25,11 +25,96 @@ type ResourceKind = jmsd.ResourceKind
 
 // Column indices in the resources table. Named because the header, the width
 // rule and the double-click copy all refer to them.
+// columnRole says what a table column is, independently of where it sits.
+//
+// Position used to be identity -- nameColumn = 0 and so on -- which stopped
+// working the moment a per-kind column had to sit BETWEEN two fixed ones
+// (OWNER between NAME and ADDRESS). The role is what the rest of the file
+// actually cares about: which cell the double-click copies from, which two
+// columns absorb the spare width.
+type columnRole int
+
 const (
-	nameColumn       = 0
-	addressColumn    = 1
-	sourceTypeColumn = 2
+	roleName columnRole = iota
+	roleAddress
+	roleSourceType
+	// roleExtra is a per-kind column: it draws its text from value and is
+	// present only for the kinds it lists.
+	roleExtra
 )
+
+// column is one column of the resources table.
+type column struct {
+	role    columnRole
+	heading string
+	// reserve is the display width held back so tview cannot drop this column
+	// off the right edge -- it lays columns out left to right and simply
+	// discards what no longer fits, so without a reserve the LAST column is
+	// the one that vanishes on a narrow terminal. Zero means "takes the spare
+	// width instead", which is NAME and ADDRESS.
+	//
+	// The numbers come from the widest value in production, not from
+	// guesswork: instance types run to 18 characters, team names to 12
+	// ("Payments"), modules to 7 ("Monitor").
+	reserve int
+	// kinds are the resource kinds this column applies to; nil means every
+	// kind. ResourceAll is deliberately absent from the per-kind ones: the
+	// mixed view would show columns that are blank for most of their rows,
+	// and the width they cost comes out of NAME and ADDRESS, which every row
+	// uses.
+	kinds []ResourceKind
+	// value renders the cell, for roleExtra only. The other roles have their
+	// own rendering (a star prefix, a source-type palette).
+	value func(resource ResourceRow) string
+}
+
+// hostKinds are the kinds whose rows are machines, and so the ones with a
+// shape, an owning team and a module.
+var hostKinds = []ResourceKind{ResourceEC2}
+
+// tableColumns is the column order, top to bottom of this slice, left to right
+// on screen. Adding a column is one entry here plus one field on
+// jmsd.AssetRow -- and the second half is the expensive one, see
+// jmsd.cloudBrief for the bar it has to clear.
+var tableColumns = []column{
+	{role: roleName, heading: "NAME"},
+	{role: roleExtra, heading: "OWNER", reserve: 12, kinds: hostKinds,
+		value: func(r ResourceRow) string { return r.OwnerTeam }},
+	{role: roleAddress, heading: "ADDRESS"},
+	{role: roleExtra, heading: "INSTANCE TYPE", reserve: 18, kinds: hostKinds,
+		value: func(r ResourceRow) string { return r.InstanceType }},
+	{role: roleExtra, heading: "MODULE", reserve: 7, kinds: hostKinds,
+		value: func(r ResourceRow) string { return r.AppModule }},
+	{role: roleSourceType, heading: sourceTypeHeading, reserve: sourceTypeReserve},
+}
+
+// activeColumns is the layout for one resource kind, in table order.
+//
+// Width plays no part. An earlier version dropped columns to fit and that was
+// a mistake twice over: the cells are written before any width is known, so
+// changing the SET meant rebuilding the table from inside its own draw
+// function -- and the only safe way to defer that, QueueUpdate, blocks until
+// the event loop runs it, which during a draw is the event loop waiting for
+// itself. Widths are capped instead (see columnWidths); every column stays.
+func activeColumns(kind ResourceKind) []column {
+	out := make([]column, 0, len(tableColumns))
+	for _, c := range tableColumns {
+		if c.kinds == nil || slices.Contains(c.kinds, kind) {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// columnIndex finds where a role sits in a layout, or -1.
+func columnIndex(layout []column, role columnRole) int {
+	for i, c := range layout {
+		if c.role == role {
+			return i
+		}
+	}
+	return -1
+}
 
 // Resource table column widths, in cells.
 //
@@ -103,11 +188,21 @@ func sourceTypeLabel(resource ResourceRow) string {
 
 // ResourceRow is one row in the resources panel.
 type ResourceRow struct {
-	ID       string
-	Name     string
-	Address  string
-	Category string // JumpServer asset category: host / database / cloud / ...
-	Type     string // JumpServer asset type within category, e.g. redis / k8s
+	ID      string
+	Name    string
+	Address string
+	// CloudKey addresses this machine's cloud metadata, empty when it has
+	// none. The listing carries the key rather than the metadata, so "d"
+	// fetches the one row it needs -- and an empty key answers "d" with no
+	// request at all.
+	CloudKey string
+	// InstanceType, OwnerTeam and AppModule are shown as per-kind columns
+	// under ":ec2" -- see extraColumns. Only hosts have them.
+	InstanceType string
+	OwnerTeam    string
+	AppModule    string
+	Category     string // JumpServer asset category: host / database / cloud / ...
+	Type         string // JumpServer asset type within category, e.g. redis / k8s
 	// NodeIDs is direct node membership only, never ancestors, so subtree
 	// tallies have to aggregate down the tree themselves -- see subtreeMatches.
 	NodeIDs []string
@@ -145,17 +240,42 @@ func (w *Workspace) applyResources(rows []ResourceRow) {
 // shown". Both the table and the scope tree's per-node counts go through it,
 // so the tree can never claim a node holds rows the table wouldn't list.
 // query must already be lower-cased and trimmed.
-func matchesFilter(resource ResourceRow, kind ResourceKind, query string) bool {
+func matchesFilter(resource ResourceRow, kind ResourceKind, query string, layout []column) bool {
 	if !jmsd.MatchesKind(kind, resource.Category, resource.Type) {
 		return false
 	}
 	if query == "" {
 		return true
 	}
-	searchable := strings.ToLower(strings.Join([]string{
-		resource.Name, resource.Address,
-	}, " "))
-	return strings.Contains(searchable, query)
+	return strings.Contains(searchableText(resource, layout), query)
+}
+
+// searchableText is every cell of the row that is currently on screen, lowered
+// and joined.
+//
+// Scoped to the columns the current kind DECLARES, which is what makes a
+// match explainable: the row that came back has the query in one of its cells.
+// Searching fields the view does not show at all would make rows appear for no
+// visible reason, indistinguishable from a broken filter.
+//
+// Width is deliberately not part of it -- see the caller. A column trimmed off
+// a narrow window is still searched, which is the lesser of two oddities next
+// to "resizing the terminal changed my results".
+func searchableText(resource ResourceRow, layout []column) string {
+	parts := make([]string, 0, len(layout))
+	for _, col := range layout {
+		switch col.role {
+		case roleName:
+			parts = append(parts, resource.Name)
+		case roleAddress:
+			parts = append(parts, resource.Address)
+		case roleSourceType:
+			parts = append(parts, sourceTypeLabel(resource))
+		default:
+			parts = append(parts, col.value(resource))
+		}
+	}
+	return strings.ToLower(strings.Join(parts, " "))
 }
 
 // matching collects every loaded resource that passes the current kind and
@@ -165,8 +285,13 @@ func matchesFilter(resource ResourceRow, kind ResourceKind, query string) bool {
 // counts are its length, so the two cannot drift apart.
 func (w *Workspace) matching(dst []ResourceRow, members map[string]struct{}) []ResourceRow {
 	dst = dst[:0]
+	// Resolved once, not per row: the layout is the same for every row in a
+	// render, and this runs on every keystroke in the "/" box. The scope tree
+	// derives the same set (subtreeAssetIDs) so a node's count and the rows
+	// it opens to are decided identically.
+	cols := w.columns()
 	for _, resource := range w.resources {
-		if !matchesFilter(resource, w.kind, w.searchQuery) {
+		if !matchesFilter(resource, w.kind, w.searchQuery, cols) {
 			continue
 		}
 		if members != nil {
@@ -314,6 +439,7 @@ func (w *Workspace) applyFilters(query string) {
 	// star's own width is added here, since starring is not a property of the
 	// row's text.
 	w.naturalName, w.naturalAddress = nameHeadingWidth, addressHeadingWidth
+	layout := w.columns()
 	for i, resource := range w.visible {
 		row := i + 1
 		name, nameWidth := resource.Name, resource.nameWidth
@@ -322,9 +448,20 @@ func (w *Workspace) applyFilters(query string) {
 		}
 		w.naturalName = max(w.naturalName, nameWidth)
 		w.naturalAddress = max(w.naturalAddress, resource.addressWidth)
-		w.table.SetCell(row, 0, resourceCell(name, resource.ID))
-		w.table.SetCell(row, 1, resourceCell(resource.Address, resource.ID))
-		w.table.SetCell(row, 2, sourceTypeCell(sourceTypeLabel(resource), resource.ID))
+		for index, col := range layout {
+			var cell *tview.TableCell
+			switch col.role {
+			case roleName:
+				cell = expandingCell(name, resource.ID)
+			case roleAddress:
+				cell = expandingCell(resource.Address, resource.ID)
+			case roleSourceType:
+				cell = narrowCell(sourceTypeLabel(resource), resource.ID)
+			default:
+				cell = narrowCell(col.value(resource), resource.ID)
+			}
+			w.table.SetCell(row, index, cell)
+		}
 	}
 	// The cells above are new, so whatever caps were applied to the old ones
 	// are gone with them.
@@ -347,8 +484,8 @@ func (w *Workspace) applyFilters(query string) {
 //
 // Split out from fitColumns because this is the whole of the resize policy and
 // it is worth being able to test at widths a terminal is awkward to produce.
-func columnCaps(width, naturalName, naturalAddress int) (nameMax, addressMax int) {
-	budget := width - columnGaps - sourceTypeReserve
+func columnCaps(width, naturalName, naturalAddress, otherReserve int) (nameMax, addressMax int) {
+	budget := width - otherReserve
 	if budget <= 0 || naturalName+naturalAddress <= budget {
 		// Either everything fits already, or the table is too narrow for any
 		// arrangement to help. Capping in the first case would truncate text
@@ -365,8 +502,76 @@ func columnCaps(width, naturalName, naturalAddress int) (nameMax, addressMax int
 	return nameMax, max(budget-nameMax, 1)
 }
 
+// columnWidths returns the MaxWidth for each column of a table this wide.
+// Zero means "no cap".
+//
+// The order the budget is spent in is the whole policy, and it is ordered by
+// what is unusable without:
+//
+//  1. one cell per column, which tview charges as separators;
+//  2. SOURCE TYPE's reserve, and NAME and ADDRESS's floors -- the three
+//     columns every row has something in;
+//  3. each per-kind column, left to right, up to its reserve. What is left
+//     over caps it instead, down to a single cell: an ellipsis keeps the
+//     column and its heading on screen, where dropping it would leave the
+//     reader wondering whether the field exists at all;
+//  4. anything still spare widens NAME and ADDRESS, up to their natural
+//     widths.
+//
+// Nothing is ever removed. tview lays columns out left to right and discards
+// what does not fit, so the casualty of overflowing would be the LAST column
+// -- and that is SOURCE TYPE, which this package already has a regression
+// test for losing.
+func columnWidths(cols []column, width, naturalName, naturalAddress int) []int {
+	caps := make([]int, len(cols))
+
+	// What is left after the costs nothing can be taken from: one cell per
+	// column, which tview charges as separators, and SOURCE TYPE's reserve.
+	avail := width - len(cols)
+	for _, col := range cols {
+		if col.role == roleSourceType {
+			avail -= col.reserve
+		}
+	}
+
+	// Then the per-kind columns, left to right, each yielding to NAME and
+	// ADDRESS's floors rather than the other way round.
+	for i, col := range cols {
+		if col.role != roleExtra {
+			continue
+		}
+		switch spare := avail - nameFloor - addressFloor; {
+		case spare >= col.reserve:
+			avail -= col.reserve // fits at full width, no cap needed
+		case spare > 0:
+			caps[i] = spare
+			avail -= spare
+		default:
+			// A single cell renders as an ellipsis, which keeps the column
+			// and its heading on screen. Dropping it would leave the reader
+			// wondering whether the field exists at all -- and dropping is
+			// also what tview does on its own, from the right, where the
+			// casualty is SOURCE TYPE.
+			caps[i] = 1
+			avail--
+		}
+	}
+
+	nameMax, addressMax := columnCaps(avail, naturalName, naturalAddress, 0)
+	if at := columnIndex(cols, roleName); at >= 0 {
+		caps[at] = nameMax
+	}
+	if at := columnIndex(cols, roleAddress); at >= 0 {
+		caps[at] = addressMax
+	}
+	return caps
+}
+
 // fitColumns re-caps the columns for a table of the given inner width. Called
 // on every draw, so it does nothing unless the width or the rows changed.
+//
+// Only MaxWidth is touched. This runs inside the table's own SetDrawFunc, so
+// it must not add, remove or reselect cells -- see activeColumns.
 func (w *Workspace) fitColumns(width int) {
 	if width == w.fitWidth && !w.fitDirty {
 		return
@@ -374,32 +579,41 @@ func (w *Workspace) fitColumns(width int) {
 	w.fitWidth = width
 	w.fitDirty = false
 
-	nameMax, addressMax := columnCaps(width, w.naturalName, w.naturalAddress)
+	cols := w.columns()
+	caps := columnWidths(cols, width, w.naturalName, w.naturalAddress)
 	// Row 0 is the header, which is capped too -- a heading that outlived its
 	// column would be measured into the layout and defeat the cap.
 	for row := 0; row <= len(w.visible); row++ {
-		w.table.GetCell(row, 0).SetMaxWidth(nameMax)
-		w.table.GetCell(row, 1).SetMaxWidth(addressMax)
+		for column := range cols {
+			if cell := w.table.GetCell(row, column); cell != nil {
+				cell.SetMaxWidth(caps[column])
+			}
+		}
 	}
 }
 
 func (w *Workspace) setTableHeader() {
-	// Indexed by the column constants so the headings and the indices cannot
-	// drift out of order.
-	headings := [...]string{nameColumn: nameHeading, addressColumn: addressHeading, sourceTypeColumn: sourceTypeHeading}
-	for column, heading := range headings {
-		cell := tview.NewTableCell(heading)
-		cell.SetTextColor(theme.Header)
-		cell.SetAttributes(tcell.AttrBold)
-		cell.SetSelectable(false)
-		// SOURCE TYPE holds one short word out of a fixed vocabulary, so it
-		// takes no share of the spare width -- that all goes to NAME and
-		// ADDRESS, which are the columns that actually get truncated.
-		if column != sourceTypeColumn {
-			cell.SetExpansion(1)
-		}
-		w.table.SetCell(0, column, cell)
+	for index, col := range w.columns() {
+		// Only NAME and ADDRESS take a share of the spare width; every other
+		// column holds short values out of a small vocabulary, and giving
+		// them room would take it from the two that actually get truncated.
+		w.table.SetCell(0, index, headerCell(col.heading, col.reserve == 0))
 	}
+}
+
+// columns is the active column set. Derived on each call rather than cached in
+// a field, so it cannot go stale against w.kind.
+func (w *Workspace) columns() []column { return activeColumns(w.kind) }
+
+func headerCell(heading string, expand bool) *tview.TableCell {
+	cell := tview.NewTableCell(heading)
+	cell.SetTextColor(theme.Header)
+	cell.SetAttributes(tcell.AttrBold)
+	cell.SetSelectable(false)
+	if expand {
+		cell.SetExpansion(1)
+	}
+	return cell
 }
 
 // SetInitialKind pre-selects which resource kind the workspace opens showing
@@ -448,15 +662,20 @@ func (w *Workspace) filterCurrent(query string) {
 	w.renderResources(query)
 }
 
-func resourceCell(text, id string) *tview.TableCell {
-	return sourceTypeCell(text, id).SetExpansion(2)
+// expandingCell is a cell in one of the two columns that absorb the spare
+// width, NAME and ADDRESS.
+func expandingCell(text, id string) *tview.TableCell {
+	return narrowCell(text, id).SetExpansion(2)
 }
 
-// sourceTypeCell is resourceCell without the expansion, so the column stays
-// the width of its widest label instead of taking a third of the table for a
-// four-character word. Narrow is the only thing different about it: it used
-// to be dimmed as well, which read as "this one matters less".
-func sourceTypeCell(text, id string) *tview.TableCell {
+// narrowCell is expandingCell without the expansion, so the column stays the
+// width of its widest value instead of taking a share of the table for a
+// four-character word. Narrow is the only thing different about it: these
+// cells used to be dimmed as well, which read as "this one matters less".
+//
+// Used by every column except NAME and ADDRESS -- it was called
+// sourceTypeCell when SOURCE TYPE was the only one.
+func narrowCell(text, id string) *tview.TableCell {
 	cell := tview.NewTableCell(tview.Escape(text))
 	cell.SetReference(id)
 	return cell

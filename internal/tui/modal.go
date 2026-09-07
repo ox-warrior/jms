@@ -135,7 +135,7 @@ func (u *UI) promptOTP(ctx context.Context, username, errMsg string) (string, er
 		hint:      hintText,
 		hintColor: hintColor,
 	}, func(finish func(string, error)) tview.Primitive {
-		field := tview.NewInputField().SetLabel("MFA code ").SetMaskCharacter('•')
+		field := tview.NewInputField().SetLabel("MFA code ")
 		field.SetLabelColor(theme.Accent).SetFieldBackgroundColor(theme.Bg).SetFieldTextColor(theme.Fg)
 		field.SetDoneFunc(func(key tcell.Key) {
 			if key == tcell.KeyEnter {

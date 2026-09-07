@@ -4,6 +4,7 @@ go 1.24.0
 
 require (
 	github.com/gdamore/tcell/v2 v2.8.1
+	github.com/go-sql-driver/mysql v1.10.1
 	github.com/google/uuid v1.6.0
 	github.com/jumpserver-dev/sdk-go v0.0.0-20251124103107-b0606d78540f
 	github.com/lib/pq v1.12.3
@@ -17,6 +18,7 @@ require (
 )
 
 require (
+	filippo.io/edwards25519 v1.2.0 // indirect
 	github.com/LeeEirc/httpsig v1.2.1 // indirect
 	github.com/boombuler/barcode v1.0.1-0.20190219062509-6c824513bacc // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
