@@ -221,12 +221,31 @@ scripts/release.sh 1.2.3 --build-only # 只编译到 dist/，不接触 S3，本�
 
 ## 构建
 
+统一入口是 `make`，`make help` 列出全部目标。
+
 ```bash
-go mod download
-go test ./...
-go build -o jms ./cmd/jms
-go build -o jmsd ./cmd/jmsd
+make build          # 本机架构，三个二进制都编到仓库根目录
+make check          # gofmt + vet + test，提交前跑这个
 ```
+
+**发版是两条独立的路，而且有顺序**：
+
+```bash
+make jmsd-release VERSION=0.2.0   # ① 交叉编译机房那台的 jmsd，产物在 dist/
+make release      VERSION=0.2.0   # ② jms 交叉编译三平台并上传 CDN
+```
+
+`VERSION` 是必填的，没有默认值。`internal/version.Version` 源码里躺的是
+`dev`，靠 ldflags 注入——而 `/v1/whoami` 报的就是这个值、客户端拿它跟自己比，
+所以编出一个 `dev` 的 jmsd 会让每个人的界面顶上都挂一条「版本不一致」，把人
+指向错的方向。`make release-dry VERSION=…` 只编到 `dist/`，不碰网络。
+
+**先部 jmsd 再发 jms。** 云元数据、`cloud_key` 和 `OWNER`/`INSTANCE TYPE`/
+`MODULE` 三列全靠 jmsd 下发；新 jms 连老 jmsd 会拿不到，`d` 面板全说「没有
+元数据」、三列全空，而版本提示只会说「jms 需更新」。
+
+**jmsd 不进 CDN。** 那套自动更新是给用户笔记本上的 jms 用的；把一个持有 Core
+凭据和只读库账号的服务放到公开分发里没有道理，机房那台手工部署。
 
 这样构建出来的 `jms` 版本号是 `dev`，自动更新对它不生效——`dev` 解析不成 semver，客户端读不懂就不提示，正是从 clone 直接构建时想要的行为（本地代码不是「落后于发布版」，是跟发布版无关）。正式发布走 `scripts/release.sh <版本号>`，它会用 `-ldflags` 把真实版本号注进去。
 
