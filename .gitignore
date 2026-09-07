@@ -10,6 +10,10 @@ coverage.out
 # 地址一样——仓库里不写死任何一家的地址。
 /Makefile
 
+# 发布用的 install.sh：和上面的 Makefile 同一个理由，里面填的是真实的
+# JumpServer / jmsd / CDN 地址。模板是 scripts/install.example.sh。
+/scripts/install.sh
+
 # jmsd's own config, under any of the names it has been given. It holds the
 # access key, the Core database DSN and Core's SECRET_KEY in plaintext; only
 # jmsd.example.yaml (placeholders) belongs in the repo.

@@ -1,13 +1,17 @@
 #!/bin/bash
 #
-# jms 一键安装。三个地址都来自环境变量，仓库里不写死任何一家的域名。
+# jms 一键安装（模板）。三个地址都指向 example.com，仓库里不写死任何一家的域名。
 #
-# scripts/release.sh 上传这个文件时会把真实值替换进下面三个默认值里，所以 CDN
-# 上那一份 curl 下来直接能跑；仓库里这一份全指向 example.com，自己跑需要先
-# export 对应的变量。
+# 实际发布用的是 scripts/install.sh —— 从这个文件拷一份、填上真实地址：
 #
-# 一个文件而不是「公开版 + 内网版」两个：两份脚本必然漂移，而漂移的那一份是
-# 没人 curl 的那份，坏了也没人知道。
+#     cp scripts/install.example.sh scripts/install.sh
+#
+# 那个文件在 .gitignore 里（和 Makefile 一个规矩）。release.sh 优先上传它，没有
+# 就退回这一份，并允许用 JMS_SERVER / JMS_JMSD_ADDR / JMS_CDN_BASE 补地址。
+#
+# 为什么不是「一个文件靠 sed 替换」：替换出来的成品要上传到 CDN，而 CDN 是公开
+# 可读的（curl 一下就有）。jmsd 的地址是内网的，落在那儿等于公开——所以带真实
+# 地址的那一份从头到尾不进 git，只在发布机上存在。
 set -u
 
 cdn_base="${JMS_CDN_BASE:-https://dist.example.com/jms}"
@@ -103,37 +107,57 @@ curl -fsS "$cdn_base/version" -o ~/.jms_version 2>/dev/null || true
 installed=$("$jms_path" version 2>/dev/null | head -1)
 echo "安装完成${installed:+：$installed}。"
 
-# 首次安装顺手写一份配置。
+# 写配置。
 #
 # server 和 jmsd_addr 是必填的，源码里没有内置默认值（任何一个默认地址都只对
 # 一套部署成立），所以在这之前每个人装完都得先手写一遍这个文件才能启动——而
-# 那两个地址是这次安装唯一知道它们的时刻。
+# 这次安装正是唯一知道这些地址的时刻。
 #
-# update_url 一起写进去，否则自动更新形同不存在：不配这一项 jms 就不检查、不
-# 报错、也不写日志，于是发出去的版本没有任何人会收到提示。
+# update_url 一起写，否则自动更新形同不存在：不配这一项 jms 就不检查、不报错、
+# 也不写日志，于是发出去的版本没有任何人会收到提示。
 #
-# 已有的配置一个字都不动：里面可能有人手工改过的 log_level、cache_ttl 或者
-# 指向另一套环境的地址，覆盖掉是在解决一个不存在的问题。
+# 三项都覆盖，包括已经存在的配置。地址是会变的——jmsd 换台机器、CDN 换个域名
+# ——而这个脚本是唯一能把新地址送到每个人手上的东西。不覆盖就等于每次变更都要
+# 挨个通知人手动改，而那些改不动的人的表现是「jms 连不上」，跟服务挂了一样。
+#
+# 用户自己加的其他项（log_level、cache_ttl、k9s_path…）逐行保留：那些是偏好，
+# 不是部署事实，没有理由被一次安装重置。
 config_dir="$HOME/Library/Application Support/jms"
 [ "$platform" = "linux" ] && config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/jms"
 config_path="$config_dir/config.yaml"
 
-if [ -f "$config_path" ]; then
-    echo "配置文件已存在，未改动：$config_path"
-elif [ -z "$jms_server" ] || [ -z "$jms_jmsd_addr" ]; then
-    echo "首次运行前请先写好配置文件（server / jmsd_addr 必填），见 jms.example.yaml。"
+if [ -z "$jms_server" ] || [ -z "$jms_jmsd_addr" ]; then
+    # 公开仓库那一份走这条路：没有地址可写，不留一个半截的配置。
+    [ -f "$config_path" ] || \
+        echo "首次运行前请先写好配置文件（server / jmsd_addr 必填），见 jms.example.yaml。"
 else
-    mkdir -p "$config_dir" && cat > "$config_path" <<CONFIG
-# 由 install.sh 生成。可以随意修改，重新安装不会覆盖它。
-server: "$jms_server"
-jmsd_addr: "$jms_jmsd_addr"
-update_url: "$cdn_base"
-CONFIG
-    if [ $? -eq 0 ]; then
+    mkdir -p "$config_dir" || {
+        echo "无法创建 ${config_dir}，请照 jms.example.yaml 手写一份配置。" >&2
+        exit 1
+    }
+    tmp_config=$(mktemp "${TMPDIR:-/tmp}/jms-config.XXXXXX") || {
+        echo "无法创建临时文件，配置未更新。" >&2
+        exit 1
+    }
+    {
+        echo "# server / jmsd_addr / update_url 由 install.sh 写入，重装会覆盖成最新地址。"
+        echo "# 其他项是你自己的，重装保留。"
+        echo "server: \"$jms_server\""
+        echo "jmsd_addr: \"$jms_jmsd_addr\""
+        echo "update_url: \"$cdn_base\""
+        # 逐行搬回用户自己加的项。grep 的是行首的 key，所以注释和缩进（属于某个
+        # 块的子项，比如将来的 k8s:）都不会被误当成顶层项搬过来。
+        if [ -f "$config_path" ]; then
+            grep -vE '^[[:space:]]*(#|$)' "$config_path" 2>/dev/null \
+                | grep -vE '^(server|jmsd_addr|update_url):' || true
+        fi
+    } > "$tmp_config"
+
+    if mv -f "$tmp_config" "$config_path"; then
         chmod 0600 "$config_path"
         echo "配置已写入：$config_path"
-        echo "直接运行 jms 即可。"
     else
+        rm -f "$tmp_config"
         echo "配置写入失败，请照 jms.example.yaml 手写一份：$config_path" >&2
     fi
 fi

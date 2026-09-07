@@ -4,8 +4,16 @@
 
 ## 构建和发版走 Makefile
 
-仓库里只有 `Makefile.example`（占位符地址），本地的 `Makefile` 是从它拷出来
-改真实桶名的，已 gitignore。没有 `Makefile` 就先 `cp Makefile.example Makefile`。
+**两个文件是「模板进仓库、真实地址在本地」**，都已 gitignore，没有就先拷一份：
+
+```bash
+cp Makefile.example Makefile                      # S3 桶 + CDN + 两个客户端地址
+cp scripts/install.example.sh scripts/install.sh  # 同样三个地址，写进用户配置用
+```
+
+`install.sh` 尤其不能进 git：它会被上传到 CDN，而 CDN 公开可读，jmsd 的内网
+地址落在那儿等于公开。发布前会检查所有占位符（`example.com` / `REPLACE-ME`），
+坏的那份到不了 CDN。
 
 ```bash
 make check                        # gofmt + vet + test，提交前跑

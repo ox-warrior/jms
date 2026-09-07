@@ -169,16 +169,16 @@ macOS（arm64 / x86_64）和 Linux（x86_64）都支持，自动识别：
 ```bash
 curl -fsSL "$JMS_CDN_BASE/install.sh" | bash
 ```
-**首次安装会顺手写好配置文件**（`server` / `jmsd_addr` / `update_url`），装完直接
-`jms` 就能用。那三个地址是 `scripts/release.sh` 上传 `install.sh` 时替换进去的
-（`JMS_SERVER` / `JMS_JMSD_ADDR` / `JMS_CDN_BASE`），仓库里那一份指向
-`example.com`——公开仓库不写死任何一家的地址。
+**安装会写好配置文件**（`server` / `jmsd_addr` / `update_url`），装完直接 `jms`
+就能用。这三项**每次安装都覆盖**：地址是会变的（jmsd 换台机器、CDN 换个域名），
+而这个脚本是唯一能把新地址送到每个人手上的东西——不覆盖就等于每次变更挨个通知
+人手动改，而那些改不动的人的表现是「jms 连不上」，跟服务挂了一样。
 
-**已有的配置一个字都不会动。** 重装、升级都只换二进制：那个文件里可能有人手工
-改过的 `log_level`、`cache_ttl`，或者指向另一套环境的地址。
+**你自己加的项（`log_level`、`cache_ttl` 等）逐行保留**，那些是偏好，不是部署
+事实，没有理由被一次安装重置。
 
-`update_url` 也在生成的配置里，因为**不配这一项自动更新就形同不存在**——jms 不
-检查、不报错、也不写日志，于是发出去的版本没有任何人会收到提示。
+`update_url` 一起写进去，因为**不配这一项自动更新就形同不存在**——jms 不检查、
+不报错、也不写日志，于是发出去的版本没有任何人会收到提示。
 
 
 `$JMS_CDN_BASE` 是你们自己的发布地址（`scripts/release.sh` 上传到的那个）。本仓库不内置任何发布源，源码里的默认值是 `https://dist.example.com/jms`——上传时 `release.sh` 会把真实地址替换进 CDN 上那一份 `install.sh`，所以从 CDN curl 下来的那份不需要设环境变量，直接跑就行。
@@ -239,10 +239,21 @@ cp Makefile.example Makefile
 # 编辑 Makefile 顶部的 JMS_S3_BUCKET / JMS_CDN_BASE，改成你自己的地址
 ```
 
-`Makefile` 在 `.gitignore` 里，所以内部的桶名和域名不会进这个公开仓库——和
-`scripts/release.sh` 从环境变量读地址是同一个理由：仓库不写死任何一家的地址，
-别人 clone 下来不会指到你的机器上。地址没改就发版会直接失败，不会往占位符桶
-上传。
+`install.sh` 也一样，从模板拷一份：
+
+```bash
+cp scripts/install.example.sh scripts/install.sh
+# 填上 JumpServer / jmsd / CDN 三个真实地址
+```
+
+**`Makefile` 和 `scripts/install.sh` 都在 `.gitignore` 里**，所以内部地址不会进
+这个公开仓库。`install.sh` 尤其要这样：它会被上传到 CDN，而 CDN 是公开可读的
+（`curl` 一下就有），jmsd 的内网地址落在那儿就等于公开了——所以带真实地址的那
+一份从头到尾不进 git，只在发布机上存在。
+
+`release.sh` 优先上传 `scripts/install.sh`，没有就退回模板并允许用
+`JMS_SERVER` / `JMS_JMSD_ADDR` 补地址。任何一处还留着 `example.com` 或
+`REPLACE-ME` 都会**在上传前中止**，所以坏的那份到不了 CDN。
 
 ```bash
 make help           # 全部目标

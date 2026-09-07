@@ -27,8 +27,18 @@ cd "$repo_root"
 
 bucket="${JMS_S3_BUCKET:-s3://example-dist/jms}"
 cdn_base="${JMS_CDN_BASE:-https://dist.example.com/jms}"
-# 这两个被替换进 install.sh，让它首次安装时写出一份能直接用的配置。留空就是
-# 不写配置，用户装完仍需自己照 jms.example.yaml 手写一份。
+# 上传哪一份 install.sh。
+#
+# install.sh 里的三个地址是填死的真实值，它在 .gitignore 里、不进 git；模板
+# install.example.sh 全指向 example.com。优先用前者，因为 CDN 上的脚本必须自带
+# 正确地址——不能要求 curl | bash 的人先 export 一个他还不知道的环境变量。
+#
+# 没有它时退回模板，并允许用环境变量补地址（CI 或者临时发布用）。
+if [ -f "$repo_root/scripts/install.sh" ]; then
+    install_src="$repo_root/scripts/install.sh"
+else
+    install_src="$repo_root/scripts/install.example.sh"
+fi
 jms_server="${JMS_SERVER:-}"
 jms_jmsd_addr="${JMS_JMSD_ADDR:-}"
 dist_dir="$repo_root/dist"
@@ -51,7 +61,7 @@ for arg in "$@"; do
             exit 1
             ;;
         *)
-            [ -z "$version" ] || { echo "版本号只能给一个：已有 $version，又来了 $arg" >&2; exit 1; }
+            [ -z "$version" ] || { echo "版本号只能给一个：已有 ${version}，又来了 $arg" >&2; exit 1; }
             version="$arg"
             ;;
     esac
@@ -78,7 +88,7 @@ for t in "${TARGETS[@]}"; do
     echo "  - $goos/$goarch -> $bucket/$s3dir/jms"
 done
 $build_only || echo "  - $bucket/version"
-$build_only || echo "  - $bucket/install.sh（同步 scripts/install.sh）"
+$build_only || echo "  - $bucket/install.sh（来自 ${install_src#$repo_root/}）"
 $build_only || echo "  - $bucket/manifest.json（版本号 + 各目标 sha256，最后上传）"
 
 if ! $build_only && ! $assume_yes; then
@@ -100,27 +110,39 @@ for t in "${TARGETS[@]}"; do
     chmod a+x "$out"
 done
 
-# 把真实地址替换进 install.sh 的默认值再上传。仓库里那一份全指向 example.com
-# （公开仓库不写死任何一家的域名），而 CDN 上这一份是给人 curl | bash 的，必须自带
-# 正确地址 —— 不能要求用户先 export 一个他还不知道的环境变量。
+# 准备要上传的 install.sh：内网那份原样拿来（地址已填死），公开模板则把环境变量
+# 里的地址替换进默认值。
 sed -e "s|\${JMS_CDN_BASE:-https://dist.example.com/jms}|\${JMS_CDN_BASE:-$cdn_base}|" \
     -e "s|\${JMS_SERVER:-}|\${JMS_SERVER:-$jms_server}|" \
     -e "s|\${JMS_JMSD_ADDR:-}|\${JMS_JMSD_ADDR:-$jms_jmsd_addr}|" \
-    "$repo_root/scripts/install.sh" > "$dist_dir/install.sh"
-grep -q "$cdn_base" "$dist_dir/install.sh" || {
-    echo "install.sh 里的 CDN 地址没替换成功，中止上传。" >&2
-    exit 1
-}
-# server/jmsd_addr 是可选的，但设了就必须替换成功 —— 静默传上去一个不写配置的
-# install.sh，表现是「每个人装完都要手写配置」，而那正是设这两个变量要免掉的事。
-for pair in "JMS_SERVER:$jms_server" "JMS_JMSD_ADDR:$jms_jmsd_addr"; do
-    value="${pair#*:}"
-    [ -z "$value" ] && continue
-    grep -q "$value" "$dist_dir/install.sh" || {
-        echo "install.sh 里的 ${pair%%:*} 没替换成功，中止上传。" >&2
+    "$install_src" > "$dist_dir/install.sh"
+
+# 三个地址都必须是真的。这些检查存在的理由各不相同：
+#
+#   example.com   传上去的话，curl | bash 的人会去一个不存在的域名下载
+#   REPLACE-ME    从模板拷出来忘了填，表现是「装完 jms 连不上」，跟服务挂了一样
+#   缺 server     表现是「每个人装完都要手写配置」，而那正是这套要免掉的事
+#
+# 都在上传前，所以坏的那份永远到不了 CDN。
+for bad in "dist.example.com" "jumpserver.example.com" "jmsd.example.com" "REPLACE-ME"; do
+    grep -q "$bad" "$dist_dir/install.sh" && {
+        echo "install.sh 里还留着占位符 ${bad}，中止上传。" >&2
+        echo "填好 $install_src 里的地址（或 export JMS_SERVER / JMS_JMSD_ADDR）再发。" >&2
         exit 1
     }
 done
+grep -q "$cdn_base" "$dist_dir/install.sh" || {
+    echo "install.sh 里的 CDN 地址不是 ${cdn_base}，中止上传。" >&2
+    exit 1
+}
+grep -qE '^jms_server="\$\{JMS_SERVER:-[^}]+\}"' "$dist_dir/install.sh" || {
+    echo "install.sh 里没有 server 地址，装完的人仍要手写配置。中止上传。" >&2
+    exit 1
+}
+grep -qE '^jms_jmsd_addr="\$\{JMS_JMSD_ADDR:-[^}]+\}"' "$dist_dir/install.sh" || {
+    echo "install.sh 里没有 jmsd 地址，装完的人仍要手写配置。中止上传。" >&2
+    exit 1
+}
 
 # manifest.json 是 jms 启动时自动更新读的东西：版本号和每个目标的 sha256 必须来自
 # 同一个文件，分两次拿会出现两边描述不同构建的窗口。客户端拿不到 sha256 就拒绝更新，
