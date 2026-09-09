@@ -72,12 +72,19 @@ func (c *CoreDB) decrypt(value string) (string, error) {
 // current profile page has it only there. JumpServer's own
 // User.check_public_key() agrees -- it iterates ssh_keys.filter(is_active=True)
 // and never reads self.public_key (docs/PLAN.md §5.19).
+//
+// u.is_active is filtered too, not just the key's own flag. Disabling a user
+// in JumpServer is the coarse "this person is gone" switch, and an operator
+// who throws it does not then go hunting for their SSH keys -- so without
+// this, a disabled user kept every access jmsd grants. That was already
+// wrong for the read endpoints; it is worse for the tunnel, where what is
+// left behind is network reachability rather than a listing (see tunnel.go).
 func (c *CoreDB) activeSSHKeys() ([]sshKeyRow, error) {
 	rows, err := c.db.Query(
 		`SELECT u.id, u.username, u.otp_secret_key, k.public_key
 		 FROM authentication_sshkey k
 		 JOIN users_user u ON u.id = k.user_id
-		 WHERE k.is_active = true`,
+		 WHERE k.is_active = true AND u.is_active = true`,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("scan ssh keys: %w", err)
