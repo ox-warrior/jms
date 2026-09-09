@@ -104,19 +104,25 @@ func (p *tunnelPolicy) allow(ip net.IP, port int) error {
 }
 
 // resolveTunnelTarget turns the host a client asked for into the single IP that
-// will be dialled, checking policy against every address the name resolves to.
+// will be dialled, and it is the caller's job to dial exactly that IP.
 //
-// Two rules here matter more than they look:
+// Dialling the checked IP -- never the name again -- is the whole rebinding
+// defence. Checking a name and then dialling it resolves twice, and the second
+// lookup belongs to whoever controls the record: the classic hole where
+// 10.20.0.5 passes the check and 127.0.0.1 gets connected. Because the address
+// is pinned here, that hole is closed regardless of what else the name
+// resolves to.
 //
-// Every resolved address must pass, not just the one dialled. A name that
-// resolves to one permitted and one forbidden address is a DNS rebinding
-// attempt in all but intent, and there is no way to know which record a later
-// lookup would return.
+// So the policy picks the first address that PASSES, rather than demanding
+// that every address does. Requiring all of them looks stricter and buys
+// nothing on top of pinning -- while breaking almost every real name: a
+// dual-stack host answers with both A and AAAA records, so an allow list
+// covering only IPv4 refused www.example.com outright even though its A record
+// was permitted. The refusal then read "not in tunnel.allow" against an IPv6
+// address the operator never knowingly excluded.
 //
-// The caller dials the returned IP, never the name. Checking a name and then
-// dialling it resolves twice, and the second lookup is the attacker's to
-// control -- the classic hole where 10.20.0.5 passes the check and 127.0.0.1
-// gets connected.
+// The error names the last address that failed, since with nothing permitted
+// that is the most specific thing there is to report.
 func resolveTunnelTarget(ctx context.Context, lookup lookupIPFunc, policy *tunnelPolicy, host string, port int) (net.IP, error) {
 	if ip := net.ParseIP(host); ip != nil {
 		if err := policy.allow(ip, port); err != nil {
@@ -131,10 +137,13 @@ func resolveTunnelTarget(ctx context.Context, lookup lookupIPFunc, policy *tunne
 	if len(addrs) == 0 {
 		return nil, fmt.Errorf("resolve %s: no addresses", host)
 	}
+	var lastErr error
 	for _, ip := range addrs {
 		if err := policy.allow(ip, port); err != nil {
-			return nil, fmt.Errorf("%s -> %w", host, err)
+			lastErr = err
+			continue
 		}
+		return ip, nil
 	}
-	return addrs[0], nil
+	return nil, fmt.Errorf("%s -> %w", host, lastErr)
 }

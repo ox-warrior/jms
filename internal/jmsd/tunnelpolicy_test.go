@@ -102,37 +102,28 @@ func TestCompileTunnelPolicyRejectsUnusableRules(t *testing.T) {
 	}
 }
 
-// The check must apply to what the name resolves to, and the caller must dial
-// the address that was checked. Checking a name and then dialling it resolves
-// twice, and the second lookup belongs to whoever controls the record.
-func TestResolveTunnelTargetChecksEveryResolvedAddress(t *testing.T) {
-	policy := mustPolicy(t, TunnelRule{CIDR: "10.20.0.0/16", Ports: []int{443}})
-	lookup := func(answers ...string) lookupIPFunc {
-		return func(context.Context, string, string) ([]net.IP, error) {
-			ips := make([]net.IP, 0, len(answers))
-			for _, a := range answers {
-				ips = append(ips, net.ParseIP(a))
-			}
-			return ips, nil
+func fixedLookup(answers ...string) lookupIPFunc {
+	return func(context.Context, string, string) ([]net.IP, error) {
+		ips := make([]net.IP, 0, len(answers))
+		for _, a := range answers {
+			ips = append(ips, net.ParseIP(a))
 		}
+		return ips, nil
 	}
+}
 
-	ip, err := resolveTunnelTarget(context.Background(), lookup("10.20.1.5"), policy, "app.internal", 443)
+// The address that gets dialled must be the one that was checked -- pinning it
+// here is the whole DNS-rebinding defence, since dialling the NAME would
+// resolve a second time and that lookup belongs to whoever controls the record.
+func TestResolveTunnelTargetPinsTheCheckedAddress(t *testing.T) {
+	policy := mustPolicy(t, TunnelRule{CIDR: "10.20.0.0/16", Ports: []int{443}})
+
+	ip, err := resolveTunnelTarget(context.Background(), fixedLookup("10.20.1.5"), policy, "app.internal", 443)
 	if err != nil {
 		t.Fatalf("permitted name refused: %v", err)
 	}
 	if !ip.Equal(net.ParseIP("10.20.1.5")) {
 		t.Fatalf("resolved to %s, want the checked address 10.20.1.5", ip)
-	}
-
-	// One permitted and one forbidden answer: refused outright, because there
-	// is no telling which record a later lookup would return.
-	_, err = resolveTunnelTarget(context.Background(), lookup("10.20.1.5", "127.0.0.1"), policy, "rebind.internal", 443)
-	if err == nil {
-		t.Fatal("a name resolving to both 10.20.1.5 and 127.0.0.1 was allowed")
-	}
-	if !strings.Contains(err.Error(), "loopback") {
-		t.Errorf("error %q does not say which address was refused", err)
 	}
 
 	// A literal address never reaches the resolver at all.
@@ -141,5 +132,52 @@ func TestResolveTunnelTargetChecksEveryResolvedAddress(t *testing.T) {
 	}, policy, "10.20.1.5", 443)
 	if err != nil {
 		t.Fatalf("literal IP: %v", err)
+	}
+}
+
+// The regression: this used to demand that EVERY resolved address pass, which
+// refused essentially every real hostname. A dual-stack name answers with both
+// A and AAAA records, so an allow list covering only IPv4 rejected the name
+// outright -- and the message blamed an IPv6 address the operator had never
+// knowingly excluded ("www.google.com -> 2404:6800:...:443 refused: not in
+// tunnel.allow"). Every page in a browser pointed at the tunnel failed.
+//
+// Demanding all of them bought nothing: the rebinding hole is closed by
+// pinning the address that gets dialled, which the test above covers.
+func TestResolveTunnelTargetPicksAPermittedAddressFromADualStackName(t *testing.T) {
+	policy := mustPolicy(t, TunnelRule{CIDR: "0.0.0.0/0", Ports: []int{443}})
+
+	// AAAA first, exactly the order a resolver commonly returns.
+	ip, err := resolveTunnelTarget(context.Background(),
+		fixedLookup("2404:6800:4003:c1a::65", "142.251.151.119"), policy, "www.google.com", 443)
+	if err != nil {
+		t.Fatalf("dual-stack name refused with an IPv4 allow list: %v", err)
+	}
+	if !ip.Equal(net.ParseIP("142.251.151.119")) {
+		t.Fatalf("dialling %s, want the permitted IPv4 address 142.251.151.119", ip)
+	}
+}
+
+// Skipping over a refused address must not become a way to reach one. A name
+// that resolves ONLY to denied addresses is still refused, and the error says
+// which -- otherwise the loopback and metadata denials could be sidestepped by
+// publishing a name with a second, permitted record.
+func TestResolveTunnelTargetRefusesWhenNoAddressPasses(t *testing.T) {
+	policy := mustPolicy(t, TunnelRule{CIDR: "0.0.0.0/0", Ports: []int{443}})
+
+	_, err := resolveTunnelTarget(context.Background(),
+		fixedLookup("127.0.0.1", "169.254.169.254"), policy, "evil.internal", 443)
+	if err == nil {
+		t.Fatal("a name resolving only to loopback and metadata was allowed")
+	}
+	if !strings.Contains(err.Error(), "metadata") && !strings.Contains(err.Error(), "loopback") {
+		t.Errorf("error %q does not say which address was refused", err)
+	}
+
+	// And the port still has to match, whichever address answers.
+	_, err = resolveTunnelTarget(context.Background(),
+		fixedLookup("142.251.151.119"), policy, "www.google.com", 22)
+	if err == nil {
+		t.Fatal("port 22 was allowed by a rule listing only 443")
 	}
 }

@@ -313,13 +313,17 @@ func (l *link) serve(local net.Conn) error {
 	}
 	remote, err := l.openStream(target)
 	if err != nil {
-		_ = socksReply(local, socksFailureCode(err))
-		// Surfaced on the terminal, not just the log: a refused destination is
-		// the one failure the user can do something about (ask for the allow
-		// list to change), and a browser only shows "proxy error".
-		if errors.Is(err, ErrDestinationRefused) {
-			fmt.Fprintf(stderr, "jms: %v\n", err)
-		}
+		// The reply code carries the reason (socksFailureCode maps a policy
+		// refusal to "not allowed by ruleset", which curl and browsers print
+		// themselves), so nothing is written to the terminal here.
+		//
+		// It used to print every refusal, on the theory that a blocked
+		// destination is the one failure a user can act on. In egress mode
+		// that is unusable: a laptop with DNS-level ad blocking resolves
+		// tracker domains to 127.0.0.1, the tunnel correctly refuses loopback,
+		// and one browser tab then scrolls dozens of identical lines past a
+		// tunnel that is working perfectly well -- which reads exactly like
+		// the tunnel being broken.
 		return err
 	}
 	defer remote.Close()
