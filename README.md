@@ -112,6 +112,7 @@ flowchart LR
 ## 功能范围
 
 - 服务器地址和 jmsd 地址都可以写进配置文件，不用每次带参数；命令行参数优先，见下方「客户端配置」
+- `jms -w 9090` 起一个 SOCKS5，流量从 `jmsd` 那台机器拨出去。**默认在 jmsd 侧关闭**，开了之后 Core 里不留任何记录——详见下方「隧道」
 - **不用输用户名**：启动即用本地 SSH 私钥的公钥指纹向 jmsd 反查身份，见下
 - SSH 私钥按顺序查找：显式指定 → `~/.ssh/id_rsa` → `~/.ssh/id_ed25519`，不读 `ssh-agent`
 - 启动不会直接连 Koko——只在真正选中资产连接、或 jmsd 要求验 MFA 时才会跟 JumpServer 打交道，见下
@@ -536,6 +537,7 @@ GRANT SELECT ON cloud_meta.cloud_instance_info TO 'jmsd_readonly'@'%';
 ```text
 GET  /v1/whoami        ?fp=&ts=&nonce=&sig=                            -> {username, server_version, jumpserver_baseline}
 GET  /v1/k8s-config    ?fp=&ts=&nonce=&sig=                            -> {proxy_url, insecure_skip_verify}（来自 config-jmsd.yaml 的 k8s 段，全员共用同一份）
+GET  /v1/tunnel-config ?fp=&ts=&nonce=&sig=                            -> {addr, host_key}（隧道监听在哪、会出示哪把 host key；addr 为空表示没开隧道）
 GET  /v1/nodes         ?fp=&ts=&nonce=&sig=                            -> [{id, name, children}]，权限树，嵌套 JSON
 GET  /v1/assets        ?fp=&ts=&nonce=&sig=                            -> [{id, name, address, category, type, node_ids, cloud_key}]
                        （一次返回全部有权限的资产，没有 node 过滤参数：scope/分类/搜索都在客户端对这一份做，
@@ -580,6 +582,30 @@ JumpServer 基线故意是**两个独立常量而不是一个共享的**——�
 
 版本号是手改的常量，不从 git 推导：`internal/version/version.go`（构建版本 + jms 侧基线）和 `internal/jmsd/config.go`（jmsd 侧基线）。
 
+### 隧道（`jms -w PORT`）
+
+```bash
+jms -w 9090                       # 笔记本上起 SOCKS5，流量从 jmsd 那台机器拨出去
+curl -x socks5h://127.0.0.1:9090 https://internal.example.com
+```
+
+`jmsd` 默认**不**开这个功能，要在它的配置里显式打开（见 `jmsd.example.yaml` 的 `tunnel:` 段）。开了之后 `jmsd` 多监听一个端口，讲 SSH，只处理 `direct-tcpip` 一种 channel —— 没有 shell，`session` channel 一律拒绝。
+
+**发版顺序还是 jmsd 先**：老 jmsd 没有 `/v1/tunnel-config`，新 jms 的 `-w` 会明确报「这台 jmsd 比隧道功能老，需要先升级」而不是 `404 page not found`——但能看到那句话的前提是那一版 jmsd 已经上了。
+
+**为什么走 SSH、而不是复用控制面的 HTTP 端口**：认证由协议本身完成——客户端在握手里证明持有私钥，没有时间戳窗口要对、没有 nonce 要记，防重放是密钥交换的事；而它证明的身份就是控制面用的那一个：公钥指纹去查 JumpServer 里登记的 key（`userDirectory`）。顺带解决三件事：一条连接多路复用（浏览器开三十个流只握手一次）、不受前置 TLS 代理缓冲影响（HTTP hijack 会被 nginx/ALB 卡成半双工）、数据面端口能单独做防火墙策略。
+
+**MFA 和吊销的体验和别处一致**，靠的是把提示留在控制面：
+
+- `-w` 启动先发一次签名的 `/v1/tunnel-config`，那一跳穿的是和其他接口同一个 `authorize()`，MFA 过期就在这里弹验证码——同样的文案、同样的重试、同样的 429 锁定提示。**验过了才去拨 SSH**，所以 SSH 那边的 MFA 检查合法客户端永远不会触发；它只挡「拿到私钥直接拨数据面」的人，而那个人看到的是一句笼统的 `unable to authenticate`，什么都问不出来
+- 状态同源：两条路读的是同一份 MFA 记录，所以在 TUI 里验过一次，隧道跟着续期；反过来也一样
+- 隧道开着的时候 MFA 到期、或者公钥在 JumpServer 里被停用：新流会被拒，reason 是 `mfa_required` 的那种可恢复——客户端在终端里问一次验证码、重连、把刚才那条流补上；不可恢复的（key 被吊销、目标不在 allow 里）直接打印原因，不会在提示框里打转。这个区分在 `internal/tunnel/tunnel.go` 的 `classify`，四条出口都有测试
+- 认证只在握手那一次，所以长命连接必须另外收：每 30s 复查一遍公钥还在不在索引里、MFA 还新鲜不新鲜，不过关就**关掉整条连接**（不是只拒新流——穿过隧道的那条数据库连接否则会活过吊销）。吊销窗口 = 30s + `keyIndexTTL` 的 30s，和 HTTP 路径本来就接受的是同一个窗口
+
+**授权是两道闸的交集**：`tunnel.allow` 必填（空列表拒绝启动），`require_permitted_asset` 再把目标收窄到调用者本来就有权限的资产地址。另外无论 allow 怎么写，`169.254.0.0/16`（云元数据，会吐出 `jmsd` 宿主机的 IAM 凭据）、`127.0.0.0/8` 和 `::1`（`jmsd` 自己的 localhost，那儿有它的 Redis，能写就能替任何人跳过 MFA）、`0.0.0.0` 和组播永远拒绝，`::ffff:127.0.0.1` 这种写法也算回环。域名在 `jmsd` 那端解析，**解析出的每一个地址都要过策略**，然后拨的是查过的那个 IP 而不是域名——先查名字再拨名字等于解析两次，第二次归攻击者控制。
+
+**Core 里没有任何记录。** 没有票据、没有会话、没有命令审计——隧道的意义就是用你自己的凭据连过去，所以 `jmsd` 的日志（每条流一行：用户、请求的名字、真正拨的地址、上下行字节数、时长）是唯一能回答「谁通过隧道连了什么」的地方。这一点和 `jms` 的其他功能都不一样，开之前要接受它。
+
 ### MFA 验证码有次数限制
 
 **同一个用户连续输错 5 次验证码，`/v1/auth/mfa` 会在之后 15 分钟内一律返回 429**，错误文案带剩余时间（`too many incorrect MFA codes; try again in 14m52s`），`jms` 会把它显示在验证码输入框下面。输对一次就清零——数的是**连续**失败，偶尔手滑不会跨天累积。锁定生效的那一刻会在 stderr 打一行 `jmsd: mfa lockout: <用户名> reached 5 consecutive incorrect codes`。
@@ -597,7 +623,9 @@ JumpServer 基线故意是**两个独立常量而不是一个共享的**——�
 - jmsd 不配 `redis:` 时，MFA 状态存在进程内存里，重启后所有用户都要重新验一次；配上就不会了，见上面「MFA 状态存哪」
 - 不支持"连接时手动输入账号密码"（`@INPUT` 别名的账号）——`jmsd` 直接把这类账号从选项里过滤掉，见 `docs/PLAN.md` §5.F.30
 - 不支持 Chen（Web GUI 资产）的数据库查询执行
-- 不提供 SOCKS5。旧的 `jms socks5` 子命令已移除
+- 隧道（`jms -w`）在 Core 里**不留任何记录**：没有票据、没有会话、没有命令审计，`jmsd` 自己的日志是唯一的记录。默认关闭，见下面「隧道」
+- 隧道只做 SOCKS5 的 CONNECT，不做 BIND / UDP ASSOCIATE（那两个要求代理替客户端接受入向连接）
+- 开了 `require_permitted_asset` 之后，地址是主机名而不是 IP 的资产连不通：拿域名去比对解析后的目标 IP 需要 `jmsd` 再解析一次，那会把不受控的 DNS 放进授权路径
 
 ## 安全
 
@@ -607,6 +635,7 @@ JumpServer 基线故意是**两个独立常量而不是一个共享的**——�
 - 数据库账号只给 `SELECT`，外加 `assets_favoriteasset` 一张表的 `INSERT`/`DELETE`
 - Redis（如启用）必须 `bind 127.0.0.1`——能写它的进程可以替任何人跳过 MFA
 - `jmsd` 只讲明文 HTTP，出内网前必须挂 TLS 代理
+- 隧道（如启用）的 `tunnel.host_key` 是私钥，`chmod 600`；`tunnel.allow` 要当成防火墙规则来评审，不是普通配置项
 
 发现漏洞请私下报告给仓库 owner，不要开公开 issue。
 

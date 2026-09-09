@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -44,9 +45,11 @@ var defaultJmsdAddr = ""
 // URL. Both are empty in a stock build (see defaultServer), so the common first
 // run is a user who has not written a config file yet -- the message names the
 // exact file to create rather than only stating what is missing.
-func requireAddresses(server, jmsdAddr, cfgPath string) error {
+// tunnelOnly is the "-w" run, which never dials Koko: demanding --server
+// there would refuse a mode that has no use for it.
+func requireAddresses(server, jmsdAddr, cfgPath string, tunnelOnly bool) error {
 	var missing []string
-	if strings.TrimSpace(server) == "" {
+	if !tunnelOnly && strings.TrimSpace(server) == "" {
 		missing = append(missing, "server (--server)")
 	}
 	if strings.TrimSpace(jmsdAddr) == "" {
@@ -72,6 +75,9 @@ type rootFlags struct {
 	// command is "-c TYPE [NAME]" (docs/PLAN.md §8.1), mfmc's own shortcut
 	// syntax. Empty means the ordinary TUI launch.
 	command string
+	// tunnelPort is "-w PORT": serve SOCKS5 on that loopback port and carry
+	// every stream to jmsd. Zero means no tunnel, which is the normal run.
+	tunnelPort int
 	// account pins which account a headless "-c TYPE NAME" connects as, by
 	// Username (not Alias -- see resolveAccount). Only meaningful alongside a
 	// name-bearing command; rejected on its own so a typo'd or forgotten "-c"
@@ -81,6 +87,25 @@ type rootFlags struct {
 
 func Execute() error {
 	return newRootCommand().Execute()
+}
+
+// validateTunnelFlags rejects a "-w" that cannot mean anything, alongside
+// parseCommandFlags doing the same for "--account". Split out rather than
+// inlined in RunE because each of these is a mistake a user makes once and
+// would otherwise cost them a silent no-op: "-w 9090 -c ec2 ng0" would connect
+// to the asset and exit, with no proxy ever started and nothing to say so.
+func validateTunnelFlags(flags rootFlags) error {
+	if flags.tunnelPort == 0 {
+		return nil
+	}
+	if flags.command != "" {
+		return errors.New("-w and -c cannot be combined: -w opens a proxy that stays up, " +
+			"-c connects to one asset and exits")
+	}
+	if flags.tunnelPort < 1 || flags.tunnelPort > 65535 {
+		return fmt.Errorf("-w %d: port out of range", flags.tunnelPort)
+	}
+	return nil
 }
 
 func newRootCommand() *cobra.Command {
@@ -110,6 +135,9 @@ func newRootCommand() *cobra.Command {
 			// checked before anything else runs so a typo'd or forgotten "-c"
 			// fails loudly instead of silently ignoring --account and falling
 			// back to the default account (docs/PLAN.md §8.1).
+			if err := validateTunnelFlags(flags); err != nil {
+				return resolveErr(err)
+			}
 			target, err := parseCommandFlags(flags)
 			if err != nil {
 				return resolveErr(err)
@@ -141,7 +169,7 @@ func newRootCommand() *cobra.Command {
 			// target.Name != "" is the headless "-c type name" run, which must
 			// never be interrupted by a question (see updatesWanted).
 			var updates <-chan *selfupdate.Release
-			if updatesWanted(target != nil && target.Name != "", clientCfg.DisableUpdateCheck) {
+			if updatesWanted(flags.tunnelPort != 0 || (target != nil && target.Name != ""), clientCfg.DisableUpdateCheck) {
 				updates = startUpdateCheck(clientCfg.UpdateURL)
 			}
 
@@ -168,7 +196,7 @@ func newRootCommand() *cobra.Command {
 			// empty host on the headless path, but the TUI path never calls it
 			// and would open a full-screen UI that fails on the first request
 			// with the terminal already taken. One guard covers both.
-			if err := requireAddresses(server, jmsdAddr, cfgPath); err != nil {
+			if err := requireAddresses(server, jmsdAddr, cfgPath, flags.tunnelPort != 0); err != nil {
 				return resolveErr(err)
 			}
 
@@ -185,6 +213,14 @@ func newRootCommand() *cobra.Command {
 				jmslog.Printf("---- jms %s starting (server=%s jmsd=%s debug=%t) ----",
 					version.Version, server, jmsdAddr, debug)
 				fmt.Fprintf(os.Stderr, "jms: logging to %s\n", path)
+			}
+
+			// Placed after the log is open (and before any Koko address is
+			// resolved) so a tunnel's stream failures land in the same file as
+			// everything else -- it is a long-running mode, and its log is the
+			// client-side half of jmsd's own per-stream lines.
+			if flags.tunnelPort != 0 {
+				return runTunnel(cmd.Context(), flags.tunnelPort, jmsdAddr, flags.identity)
 			}
 
 			// target.Name != "" is the only branch that dials anything itself;
@@ -247,6 +283,8 @@ func newRootCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVarP(&flags.command, "command", "c", "",
 		"shortcut: \"type\" to open the TUI pre-filtered, or \"type name\" to connect directly "+
 			"(type is one of "+strings.Join(jmsd.ResourceKindTokens(), ", ")+"; matching is exact)")
+	cmd.PersistentFlags().IntVarP(&flags.tunnelPort, "tunnel", "w", 0,
+		"serve a SOCKS5 proxy on 127.0.0.1:PORT, tunnelled through jmsd (needs tunnel.enabled on jmsd)")
 	cmd.PersistentFlags().StringVar(&flags.account, "account", "",
 		"account username to connect as with -c \"type name\" (default: the asset's first permitted account)")
 

@@ -47,19 +47,25 @@ func TestDefaultJmsdAddrIsNotLocalhost(t *testing.T) {
 func TestRequireAddresses(t *testing.T) {
 	for _, tc := range []struct {
 		name, server, jmsd string
+		tunnelOnly         bool
 		wantErr            bool
 	}{
-		{"both set", "jumpserver.example.com", "http://jmsd.example.com:8391", false},
-		{"no server", "", "http://jmsd.example.com:8391", true},
-		{"no jmsd", "jumpserver.example.com", "", true},
-		{"neither", "", "", true},
-		{"whitespace only", "  ", "\t", true},
+		{name: "both set", server: "jumpserver.example.com", jmsd: "http://jmsd.example.com:8391"},
+		{name: "no server", jmsd: "http://jmsd.example.com:8391", wantErr: true},
+		{name: "no jmsd", server: "jumpserver.example.com", wantErr: true},
+		{name: "neither", wantErr: true},
+		{name: "whitespace only", server: "  ", jmsd: "\t", wantErr: true},
+		// "-w" never dials Koko, so it must start without --server -- but it
+		// still cannot start without jmsd, which is where it learns the
+		// tunnel's address and host key.
+		{name: "tunnel needs no server", jmsd: "http://jmsd.example.com:8391", tunnelOnly: true},
+		{name: "tunnel still needs jmsd", server: "jumpserver.example.com", tunnelOnly: true, wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := requireAddresses(tc.server, tc.jmsd, "/tmp/jms/config.yaml")
+			err := requireAddresses(tc.server, tc.jmsd, "/tmp/jms/config.yaml", tc.tunnelOnly)
 			if (err != nil) != tc.wantErr {
-				t.Fatalf("requireAddresses(%q, %q) error = %v, want error = %t",
-					tc.server, tc.jmsd, err, tc.wantErr)
+				t.Fatalf("requireAddresses(%q, %q, tunnelOnly=%t) error = %v, want error = %t",
+					tc.server, tc.jmsd, tc.tunnelOnly, err, tc.wantErr)
 			}
 			// The whole point of the message is telling the user which file to
 			// write; an error that omits the path sends them to --help instead.
@@ -98,5 +104,33 @@ func TestK8sIsLocalOnly(t *testing.T) {
 	}
 	if cmd.PersistentFlags().Lookup("k9s-path") == nil {
 		t.Fatal("--k9s-path must remain available for the local k9s binary")
+	}
+}
+
+// "-w" and "-c" are two modes, not a combination: accepting both would have to
+// silently drop one. The mistake it catches is real -- someone who typed a
+// shortcut and then decided to leave a proxy up, or vice versa, gets the first
+// one they typed and no hint that the other was ignored.
+func TestValidateTunnelFlags(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		port    int
+		command string
+		wantErr bool
+	}{
+		{name: "no tunnel"},
+		{name: "tunnel only", port: 9090},
+		{name: "tunnel with -c", port: 9090, command: "ec2 ng0", wantErr: true},
+		{name: "kind-only -c still conflicts", port: 9090, command: "ec2", wantErr: true},
+		{name: "port too high", port: 70000, wantErr: true},
+		{name: "negative port", port: -1, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateTunnelFlags(rootFlags{tunnelPort: tc.port, command: tc.command})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("validateTunnelFlags(port=%d, -c %q) error = %v, want error = %t",
+					tc.port, tc.command, err, tc.wantErr)
+			}
+		})
 	}
 }
