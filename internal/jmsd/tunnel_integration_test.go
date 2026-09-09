@@ -456,3 +456,111 @@ func waitForLog(t *testing.T, buf *syncBuffer, want string) string {
 	t.Fatalf("%q never logged within 5s; got:\n%s", want, out)
 	return out
 }
+
+// max_channels exists so one client cannot exhaust jmsd's descriptors and take
+// the control plane down with it. A check-then-act version could not deliver
+// that: every channel gets its own goroutine, so a burst all read the same
+// stale count and all pass -- and the counter then stayed untouched across the
+// DNS lookup and the 10s dial that follow, so the sockets actually outstanding
+// could run well past the limit.
+//
+// Opening more streams at once than the cap allows and counting the failures is
+// what pins the reservation down. With the old shape a concurrent burst got
+// through wholesale.
+func TestTunnelMaxChannelsHoldsUnderConcurrentOpens(t *testing.T) {
+	ip := nonLoopbackIPv4(t)
+	echoHost, echoPort, stopEcho := startBoundEcho(t, ip)
+	defer stopEcho()
+
+	signer, authorized, _ := testTunnelKey(t)
+	rows := []sshKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
+	allow := []TunnelRule{{CIDR: ip + "/32", Ports: []int{echoPort}}}
+
+	const cap = 4
+	ts := newTunnelTestServer(t, rows, allow)
+	ts.srv.cfg.Tunnel.MaxChannels = cap
+	defer ts.stop()
+	if err := ts.srv.state.RecordMFA("alice", time.Now()); err != nil {
+		t.Fatalf("record mfa: %v", err)
+	}
+
+	client := dialTunnel(t, ts.addr, ts.srv.tunnelSigner.PublicKey(), signer)
+	defer client.Close()
+
+	// Twice the cap, all at once, and held open -- so the count cannot drain
+	// between opens.
+	const attempts = cap * 2
+	target := net.JoinHostPort(echoHost, strconv.Itoa(echoPort))
+	var (
+		mu     sync.Mutex
+		opened []net.Conn
+		denied int
+		wg     sync.WaitGroup
+	)
+	for range attempts {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			conn, err := client.Dial("tcp", target)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				denied++
+				return
+			}
+			opened = append(opened, conn)
+		}()
+	}
+	wg.Wait()
+	defer func() {
+		for _, c := range opened {
+			_ = c.Close()
+		}
+	}()
+
+	if len(opened) > cap {
+		t.Fatalf("%d streams open at once with max_channels=%d: the cap was not enforced", len(opened), cap)
+	}
+	if denied == 0 {
+		t.Fatalf("all %d concurrent opens succeeded with max_channels=%d", attempts, cap)
+	}
+	t.Logf("max_channels=%d: %d opened, %d refused", cap, len(opened), denied)
+}
+
+// The reservation must be RELEASED on the paths that reject after taking it --
+// a refused destination or a failed dial. Leaking one there would let a client
+// walk the cap down to zero with requests that never opened anything, and the
+// tunnel would then refuse everything until reconnect.
+func TestTunnelMaxChannelsReleasedOnRejection(t *testing.T) {
+	ip := nonLoopbackIPv4(t)
+	echoHost, echoPort, stopEcho := startBoundEcho(t, ip)
+	defer stopEcho()
+
+	signer, authorized, _ := testTunnelKey(t)
+	rows := []sshKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
+	// The echo port is permitted; 9 is not, so opens to it are refused by policy.
+	allow := []TunnelRule{{CIDR: ip + "/32", Ports: []int{echoPort}}}
+
+	ts := newTunnelTestServer(t, rows, allow)
+	ts.srv.cfg.Tunnel.MaxChannels = 2
+	defer ts.stop()
+	if err := ts.srv.state.RecordMFA("alice", time.Now()); err != nil {
+		t.Fatalf("record mfa: %v", err)
+	}
+
+	client := dialTunnel(t, ts.addr, ts.srv.tunnelSigner.PublicKey(), signer)
+	defer client.Close()
+
+	// Burn more refusals than the cap. If each leaked its reservation, the
+	// permitted open below would fail.
+	for range 5 {
+		if _, err := client.Dial("tcp", net.JoinHostPort(ip, "9")); err == nil {
+			t.Fatal("a destination outside tunnel.allow was connected")
+		}
+	}
+	conn, err := client.Dial("tcp", net.JoinHostPort(echoHost, strconv.Itoa(echoPort)))
+	if err != nil {
+		t.Fatalf("a permitted stream was refused after 5 rejections, so the cap leaked: %v", err)
+	}
+	_ = conn.Close()
+}

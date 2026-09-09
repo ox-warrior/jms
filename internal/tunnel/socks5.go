@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strconv"
 )
 
@@ -32,7 +33,13 @@ const (
 	socksAtypNotSupported byte = 8
 )
 
-const socksConnect = 1
+const (
+	socksConnect = 1
+	// socksNoAuth is method 0x00; socksNoAcceptable is the 0xFF answer for
+	// "none of what you offered".
+	socksNoAuth       byte = 0x00
+	socksNoAcceptable byte = 0xFF
+)
 
 // socksTarget is what a CONNECT request asked for. Host stays as the client
 // wrote it -- a name is NOT resolved locally: the whole point is that the name
@@ -48,6 +55,7 @@ func (t socksTarget) String() string { return net.JoinHostPort(t.Host, strconv.I
 var (
 	errUnsupportedCommand  = errors.New("only CONNECT is supported")
 	errUnsupportedAddrType = errors.New("unsupported address type")
+	errNoAcceptableAuth    = errors.New("client offered no authentication method this proxy accepts")
 )
 
 // socksHandshake performs the greeting and reads one CONNECT request. It
@@ -65,14 +73,23 @@ func socksHandshake(rw io.ReadWriter) (socksTarget, error) {
 	if _, err := io.ReadFull(rw, methods); err != nil {
 		return socksTarget{}, fmt.Errorf("read auth methods: %w", err)
 	}
-	// No authentication, because the listener is bound to loopback and the
-	// real gate is the SSH key plus jmsd's policy. The ceiling that leaves:
-	// any process running as any user on this machine can use the tunnel
-	// while it is up. On a shared box, do not leave it running.
+	// No authentication, because the listener is bound to loopback and the real
+	// gate is the SSH key plus jmsd's policy. The ceiling that leaves: any
+	// process running as any user on this machine can use the tunnel while it
+	// is up. On a shared box, do not leave it running.
 	//
 	// ponytail: no SOCKS auth of any kind. Add RFC 1929 username/password if
 	// this ever needs to be reachable from another machine.
-	if _, err := rw.Write([]byte{socksVersion, 0}); err != nil {
+	//
+	// The offered list is checked rather than assumed: a client that only does
+	// username/password would otherwise be told "use no authentication" and
+	// then hang waiting for a request it will never send. RFC 1928 says answer
+	// 0xFF, which makes it fail immediately and say why.
+	if !slices.Contains(methods, socksNoAuth) {
+		_, _ = rw.Write([]byte{socksVersion, socksNoAcceptable})
+		return socksTarget{}, errNoAcceptableAuth
+	}
+	if _, err := rw.Write([]byte{socksVersion, socksNoAuth}); err != nil {
 		return socksTarget{}, fmt.Errorf("write auth reply: %w", err)
 	}
 

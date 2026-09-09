@@ -2,7 +2,12 @@ package tunnel
 
 import (
 	"errors"
+	"io"
+	"net"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -81,5 +86,94 @@ func TestRefusedWrapsOnlyPolicyRefusals(t *testing.T) {
 	mfa := &ssh.OpenChannelError{Reason: ssh.Prohibited, Message: jmsd.TunnelMFARequiredReason}
 	if classify(mfa) == outcomeRefused {
 		t.Error("an MFA lapse classified as a refusal: the client would never prompt again")
+	}
+}
+
+// deadConn is a reader that blocks forever, standing in for the case that
+// deadlocked: an idle peer that will never send an EOF -- a held-open database
+// connection, a browser's keep-alive socket. Closing it unblocks the Read.
+type deadConn struct {
+	closed chan struct{}
+	once   sync.Once
+}
+
+func newDeadConn() *deadConn { return &deadConn{closed: make(chan struct{})} }
+
+func (d *deadConn) Read([]byte) (int, error) {
+	<-d.closed
+	return 0, io.EOF
+}
+func (d *deadConn) Write(p []byte) (int, error) { return len(p), nil }
+func (d *deadConn) Close() error {
+	d.once.Do(func() { close(d.closed) })
+	return nil
+}
+
+// eofConn reads EOF at once and swallows writes: the side that dies when a
+// revocation closes the SSH connection.
+type eofConn struct{ closed atomic.Bool }
+
+func (e *eofConn) Read([]byte) (int, error) { return 0, io.EOF }
+func (e *eofConn) Write(p []byte) (int, error) {
+	return len(p), nil
+}
+func (e *eofConn) Close() error { e.closed.Store(true); return nil }
+
+// The regression: pipe used a WaitGroup, so when one side returned EOF while
+// the other sat on a Read that would never see one, the wait never returned
+// and NEITHER end was closed -- a leaked goroutine plus a leaked socket, on
+// exactly the revocation path this design exists for (jmsd closes the SSH
+// connection; the destination socket outlives it anyway).
+func TestPipeDoesNotDeadlockWhenOneSideNeverSendsEOF(t *testing.T) {
+	idle := newDeadConn()
+	dead := &eofConn{}
+
+	done := make(chan struct{})
+	go func() { pipe(dead, idle); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pipe did not return: one direction is blocked on a Read that will never see EOF")
+	}
+	// Both ends closed is what releases the descriptors; returning without
+	// closing would leak them just as surely as never returning.
+	select {
+	case <-idle.closed:
+	default:
+		t.Error("the idle end was left open")
+	}
+	if !dead.closed.Load() {
+		t.Error("the finished end was left open")
+	}
+}
+
+// The ordinary case still has to work: bytes cross, and a clean EOF ends it.
+func TestPipeCopiesBothDirections(t *testing.T) {
+	left, leftPeer := net.Pipe()
+	right, rightPeer := net.Pipe()
+
+	done := make(chan struct{})
+	go func() { pipe(left, right); close(done) }()
+
+	// Write into one peer, read it out of the other: left <-> right is what
+	// pipe joins, so a byte written to leftPeer must appear on rightPeer.
+	go func() {
+		_, _ = leftPeer.Write([]byte("ping"))
+		_ = leftPeer.Close()
+	}()
+	buf := make([]byte, 4)
+	_ = rightPeer.SetReadDeadline(time.Now().Add(3 * time.Second))
+	if _, err := io.ReadFull(rightPeer, buf); err != nil {
+		t.Fatalf("payload did not cross: %v", err)
+	}
+	if string(buf) != "ping" {
+		t.Fatalf("got %q, want \"ping\"", buf)
+	}
+	_ = rightPeer.Close()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("pipe did not return after both ends closed")
 	}
 }

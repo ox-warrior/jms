@@ -156,16 +156,25 @@ func (l *link) close() {
 // listener is picked up, and it costs one request per reconnect, not per
 // stream.
 func (l *link) reconnect(staleGen uint64) error {
+	// The lock is held for the WHOLE reconnect, including the MFA prompt and
+	// the dial, which is what actually makes this single-flight. Releasing it
+	// around those (as this first did) let concurrent callers all observe the
+	// same staleGen and all proceed: N control-plane calls, N TOTP prompts
+	// stacked on one tty, and -- because the last assignment wins -- every
+	// ssh.Client but one leaked as a live connection, holding an fd here and
+	// an unfinished "tunnel opened" on jmsd forever.
+	//
+	// Callers blocking on l.get() while a reconnect is in flight is the
+	// intended behaviour: what they want is the new connection.
 	l.mu.Lock()
+	defer l.mu.Unlock()
 	if staleGen != 0 && staleGen != l.gen {
-		l.mu.Unlock()
 		return nil // someone else already replaced this connection
 	}
 	if l.client != nil {
 		_ = l.client.Close()
 		l.client = nil
 	}
-	l.mu.Unlock()
 
 	cfg, err := connectflow.WithMFA(l.gate, func() (jmsd.TunnelConfigResponse, error) {
 		return l.gate.JC.TunnelConfig(l.gate.Ctx)
@@ -202,9 +211,7 @@ func (l *link) reconnect(staleGen uint64) error {
 		return fmt.Errorf("connect tunnel %s: %w", cfg.Addr, err)
 	}
 
-	l.mu.Lock()
 	l.client, l.cfg, l.gen = client, cfg, l.gen+1
-	l.mu.Unlock()
 	jmslog.Printf("tunnel: connected to %s (host key %s)", cfg.Addr, ssh.FingerprintSHA256(hostKey))
 	return nil
 }
@@ -269,7 +276,18 @@ func classify(err error) streamOutcome {
 func (l *link) openStream(target socksTarget) (net.Conn, error) {
 	client, gen, err := l.get()
 	if err != nil {
-		return nil, err
+		// No live connection: a previous reconnect failed partway (the user
+		// gave up on a TOTP prompt, jmsd was briefly unreachable, the laptop
+		// woke with no network). Retrying here is what stops that one failure
+		// from killing the tunnel for the life of the process -- it used to
+		// return, so every later stream failed against a nil client while the
+		// listener kept accepting and only jmslog.Debugf said anything.
+		if rerr := l.reconnect(gen); rerr != nil {
+			return nil, rerr
+		}
+		if client, gen, err = l.get(); err != nil {
+			return nil, err
+		}
 	}
 	conn, dialErr := client.Dial("tcp", target.String())
 	if dialErr == nil {
@@ -330,23 +348,61 @@ func (l *link) serve(local net.Conn) error {
 	if err := socksReply(local, socksSuccess); err != nil {
 		return err
 	}
+	pipe(local, remote)
+	return nil
+}
 
-	// Half-close each direction as it ends, rather than tearing both down: a
-	// client that has finished sending (a plain HTTP request, a psql query)
-	// still has a response coming.
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		_, _ = io.Copy(remote, local)
-		if cw, ok := remote.(interface{ CloseWrite() error }); ok {
-			_ = cw.CloseWrite()
-		}
-	}()
-	_, _ = io.Copy(local, remote)
-	if cw, ok := local.(*net.TCPConn); ok {
+// pipe copies between the two ends until both directions are done, half-closing
+// each as it finishes so the other survives.
+//
+// Half-closing matters because a client that has finished sending (a plain HTTP
+// request, a psql query) still has a response coming; tearing the whole
+// connection down on the first EOF truncates it.
+//
+// Waiting for BOTH directions is what the half-close costs, and getting that
+// wait wrong is how goroutines leak. This first used a WaitGroup, which
+// deadlocked whenever one side died without an EOF -- the classic case being
+// the revocation path this whole design exists for: jmsd closes the SSH
+// connection, the channel-side Copy returns at once, and the goroutine blocked
+// reading an idle keep-alive socket on the other end never wakes, so the Wait
+// never returns and neither end is ever closed.
+//
+// Closing the far end from whichever direction finishes first fixes it: that
+// unblocks the other Read, so both Copys always return. Each direction is
+// still half-closed first, so an orderly EOF stays orderly -- the full Close
+// only happens once one side is actually gone.
+func pipe(a, b io.ReadWriter) {
+	// Buffered for two so neither send can block, which is what lets the
+	// second Copy return after closeBoth without anything still reading.
+	done := make(chan struct{}, 2)
+	cp := func(dst, src io.ReadWriter) {
+		_, _ = io.Copy(dst, src)
+		halfClose(dst)
+		done <- struct{}{}
+	}
+	go cp(a, b)
+	go cp(b, a)
+	<-done
+	// One direction has ended. Closing both ends outright now is what
+	// guarantees the second Copy returns rather than sitting on a Read that
+	// will never see an EOF.
+	closeBoth(a, b)
+	<-done
+}
+
+// halfClose shuts down dst's write side if it has one. net.TCPConn and
+// ssh.Channel both do; anything else is a no-op, which is correct -- there is
+// nothing to signal.
+func halfClose(dst any) {
+	if cw, ok := dst.(interface{ CloseWrite() error }); ok {
 		_ = cw.CloseWrite()
 	}
-	wg.Wait()
-	return nil
+}
+
+func closeBoth(a, b any) {
+	for _, end := range []any{a, b} {
+		if c, ok := end.(io.Closer); ok {
+			_ = c.Close()
+		}
+	}
 }

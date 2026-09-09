@@ -697,9 +697,14 @@ func deriveTunnelAddr(requestHost, listen string) string {
 	if h, _, err := net.SplitHostPort(requestHost); err == nil {
 		host = h
 	}
-	port := strings.TrimPrefix(listen, ":")
-	if _, p, err := net.SplitHostPort(listen); err == nil {
-		port = p
+	// SplitHostPort handles every form Listen accepts, ":8392" included (it
+	// returns an empty host), so there is no bare-port case left to strip a
+	// colon from. A value it rejects is not something net.Listen would have
+	// accepted either, and passing it through unchanged makes that visible
+	// instead of quietly producing a plausible-looking address.
+	_, port, err := net.SplitHostPort(listen)
+	if err != nil {
+		return listen
 	}
 	return net.JoinHostPort(host, port)
 }

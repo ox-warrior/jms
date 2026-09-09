@@ -89,6 +89,45 @@ const (
 	TunnelMFARequiredReason = "mfa_required"
 )
 
+// pipeStream copies between an accepted channel and the dialled connection
+// until both directions are done, and reports the byte counts for the audit
+// line (up = client to destination).
+//
+// Each direction is half-closed as it finishes, because a client that has
+// stopped reading may still be sending and tearing the channel down on the
+// first EOF truncates requests that were mid-flight.
+//
+// Waiting for both directions is what the half-close costs, and getting that
+// wait wrong is how goroutines leak. This first used a WaitGroup, which
+// deadlocked on exactly the path this design exists for: revocation closes the
+// ssh.ServerConn, the channel-side Copy returns immediately, and the goroutine
+// blocked reading an idle destination -- a held-open database connection, say
+// -- never wakes, so the Wait never returns and dst is never closed. The
+// connection was revoked and the socket outlived it anyway.
+//
+// Closing both ends once either direction finishes fixes it: that unblocks the
+// other Read, so both Copys always return.
+func pipeStream(ch ssh.Channel, dst net.Conn) (up, down int64) {
+	done := make(chan struct{})
+	go func() {
+		down, _ = io.Copy(ch, dst)
+		_ = ch.CloseWrite()
+		close(done)
+	}()
+	up, _ = io.Copy(dst, ch)
+	if tcp, ok := dst.(*net.TCPConn); ok {
+		_ = tcp.CloseWrite()
+	}
+	// Closing both ends before waiting is the whole point: the goroutine may
+	// be blocked on a Read that will never see an EOF (an idle destination,
+	// or a connection revoked out from under it), and only a close wakes it.
+	// Waiting first is what deadlocked.
+	_ = ch.Close()
+	_ = dst.Close()
+	<-done
+	return up, down
+}
+
 // tunnelChannelData is direct-tcpip's channel payload (RFC 4254 §7.2).
 //
 // OriginAddr and OriginPort are never read, and dropping them looks like
@@ -120,7 +159,7 @@ type tunnelSession struct {
 	// "had 8 open at once" answer different questions, and the cap needs the
 	// second one.
 	channels      atomic.Int64
-	streamsOpened *atomic.Int64
+	streamsOpened atomic.Int64
 
 	// mu guards addrs, which the recheck ticker replaces wholesale while
 	// channel handlers read it.
@@ -170,6 +209,7 @@ func loadOrCreateTunnelHostKey(path string) (ssh.Signer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("marshal tunnel host key: %w", err)
 	}
+	encoded := pem.EncodeToMemory(block)
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, fmt.Errorf("create tunnel host key dir: %w", err)
 	}
@@ -180,7 +220,7 @@ func loadOrCreateTunnelHostKey(path string) (ssh.Signer, error) {
 	if err != nil {
 		return nil, fmt.Errorf("create tunnel host key %s: %w", path, err)
 	}
-	if _, err := f.Write(pem.EncodeToMemory(block)); err != nil {
+	if _, err := f.Write(encoded); err != nil {
 		_ = f.Close()
 		return nil, fmt.Errorf("write tunnel host key %s: %w", path, err)
 	}
@@ -188,9 +228,10 @@ func loadOrCreateTunnelHostKey(path string) (ssh.Signer, error) {
 		return nil, fmt.Errorf("write tunnel host key %s: %w", path, err)
 	}
 	log.Printf("jmsd: generated tunnel host key %s", path)
-	signer, err := ssh.ParsePrivateKey(pem.EncodeToMemory(block))
+	// From the key in hand, not by parsing back what was just written.
+	signer, err := ssh.NewSignerFromKey(priv)
 	if err != nil {
-		return nil, fmt.Errorf("parse generated tunnel host key: %w", err)
+		return nil, fmt.Errorf("sign with generated tunnel host key: %w", err)
 	}
 	return signer, nil
 }
@@ -321,12 +362,10 @@ func (s *Server) serveTunnelConn(ctx context.Context, nConn net.Conn) {
 	// the matching open line and subtracting timestamps by hand, which is
 	// exactly what nobody does at 3am.
 	opened := time.Now()
-	var streams atomic.Int64
-	sess.streamsOpened = &streams
 	log.Printf("jmsd: tunnel opened for %s from %s", sess.username, sess.remote)
 	defer func() {
 		log.Printf("jmsd: tunnel closed for %s from %s after %s, %d streams",
-			sess.username, sess.remote, time.Since(opened).Round(time.Second), streams.Load())
+			sess.username, sess.remote, time.Since(opened).Round(time.Second), sess.streamsOpened.Load())
 	}()
 
 	connCtx, cancel := context.WithCancel(ctx)
@@ -388,7 +427,16 @@ func (s *Server) recheckTunnelSession(sess *tunnelSession) error {
 		return errors.New("mfa interval lapsed")
 	}
 	if s.cfg.Tunnel.RequirePermittedAsset {
-		return s.refreshTunnelAddrs(sess)
+		// Same rule as the state store above, and it has to be: this one is an
+		// HTTP call to Core, so it is the MORE likely of the two to fail
+		// transiently. Treating that as a revocation meant one Core blip
+		// dropped every live tunnel at once, while a local Redis error -- far
+		// less likely -- was forgiven. The previously loaded address set stays
+		// in effect until a refresh succeeds; it is at most one tick stale,
+		// which is the same staleness it already carries by design.
+		if err := s.refreshTunnelAddrs(sess); err != nil {
+			debugf("tunnel recheck for %s: keeping the previous permitted-asset set: %v", sess.username, err)
+		}
 	}
 	return nil
 }
@@ -436,19 +484,43 @@ func (s *Server) handleTunnelChannel(ctx context.Context, sess *tunnelSession, n
 	// TunnelMFARequiredReason.
 	user, err := s.users.Lookup(sess.fingerprint)
 	if err != nil {
-		_ = newChan.Reject(ssh.Prohibited, "key no longer valid")
+		// ConnectionFailed, not Prohibited: the client reads Prohibited as
+		// "policy said no about this destination" and reports it that way,
+		// which would send the user to read tunnel.allow when their key has
+		// actually been deactivated. Neither is retryable, but they are
+		// different problems -- and the recheck ticker is about to close the
+		// whole session anyway.
+		log.Printf("jmsd: tunnel channel refused for %s: key no longer resolves: %v", sess.username, err)
+		_ = newChan.Reject(ssh.ConnectionFailed, "key no longer valid")
 		return
 	}
-	if fresh, ferr := s.mfaFresh(user.Username); ferr == nil && !fresh {
+	// A store error is not fatal here, for the same reason as in
+	// recheckTunnelSession -- but it is logged rather than silently passed
+	// over: an unreachable store means this gate is open, and that has to be
+	// discoverable afterwards instead of leaving no trace at all.
+	fresh, ferr := s.mfaFresh(user.Username)
+	if ferr != nil {
+		debugf("tunnel channel for %s: mfa gate skipped, state store unavailable: %v", sess.username, ferr)
+	} else if !fresh {
 		_ = newChan.Reject(ssh.Prohibited, TunnelMFARequiredReason)
 		return
 	}
 
-	if n := sess.channels.Load(); n >= int64(s.cfg.Tunnel.MaxChannels) {
-		log.Printf("jmsd: tunnel channel refused for %s: %d concurrent streams (max_channels)", sess.username, n)
+	// Reserved by incrementing FIRST, not by comparing and incrementing later.
+	// The cap exists so one client cannot exhaust jmsd's descriptors and take
+	// the control plane down with it -- and a check-then-act version could not
+	// deliver that: every channel gets its own goroutine, so a burst all read
+	// the same stale value, and the counter stayed untouched across the DNS
+	// lookup and the 10s dial that follow. The number of sockets actually
+	// outstanding could run well past the limit.
+	if n := sess.channels.Add(1); n > int64(s.cfg.Tunnel.MaxChannels) {
+		sess.channels.Add(-1)
+		log.Printf("jmsd: tunnel channel refused for %s: %d concurrent streams (max_channels)", sess.username, n-1)
 		_ = newChan.Reject(ssh.ResourceShortage, "too many concurrent streams")
 		return
 	}
+	// Released on every path from here on, including the rejections below.
+	defer sess.channels.Add(-1)
 
 	ip, err := resolveTunnelTarget(ctx, net.DefaultResolver.LookupIP, s.tunnelPolicy, data.DestAddr, port)
 	if err != nil {
@@ -480,11 +552,7 @@ func (s *Server) handleTunnelChannel(ctx context.Context, sess *tunnelSession, n
 	}
 	go ssh.DiscardRequests(reqs)
 
-	sess.channels.Add(1)
-	defer sess.channels.Add(-1)
-	if sess.streamsOpened != nil {
-		sess.streamsOpened.Add(1)
-	}
+	sess.streamsOpened.Add(1)
 
 	// The only record this stream will ever have: Core knows nothing about it.
 	// Both the requested name and the resolved address are logged, because
@@ -493,24 +561,7 @@ func (s *Server) handleTunnelChannel(ctx context.Context, sess *tunnelSession, n
 	log.Printf("jmsd: tunnel stream open user=%s requested=%s:%d target=%s from=%s",
 		sess.username, data.DestAddr, port, target, sess.remote)
 
-	var up, down int64
-	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		down, _ = io.Copy(ch, dst)
-		// Half-close rather than Close: a client that has stopped reading may
-		// still be sending, and tearing the whole channel down here truncates
-		// requests that were mid-flight.
-		_ = ch.CloseWrite()
-	}()
-	up, _ = io.Copy(dst, ch)
-	if tcp, ok := dst.(*net.TCPConn); ok {
-		_ = tcp.CloseWrite()
-	}
-	wg.Wait()
-	_ = ch.Close()
-	_ = dst.Close()
+	up, down := pipeStream(ch, dst)
 
 	log.Printf("jmsd: tunnel stream close user=%s target=%s up=%dB down=%dB duration=%s",
 		sess.username, target, up, down, time.Since(started).Round(time.Millisecond))

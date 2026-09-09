@@ -34,6 +34,20 @@ func runTunnel(ctx context.Context, port int, jmsdAddr, identityPath string) err
 	if err != nil {
 		return resolveErr(err)
 	}
+	// Ctrl-C ends the tunnel rather than killing the process mid-copy, so the
+	// listener is closed and the SSH connection torn down properly -- which is
+	// also what makes jmsd log "tunnel closed" instead of leaving the operator
+	// to infer it from silence.
+	//
+	// Installed BEFORE the Gate is built, because the Gate captures the
+	// context it will use for every later control-plane call (including the
+	// reconnects inside internal/tunnel). Building it from the outer context
+	// and shadowing the variable afterwards left those calls uncancellable:
+	// Ctrl-C closed the listener while a hung /v1/tunnel-config request ran on
+	// to its own timeout.
+	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
 	jc := jmsdclient.New(jmsdAddr, signer)
 	gate := &connectflow.Gate{JC: jc, Ctx: ctx, Prompt: promptTOTPFromTTY}
 
@@ -43,13 +57,6 @@ func runTunnel(ctx context.Context, port int, jmsdAddr, identityPath string) err
 	}
 	gate.Username = who.Username
 	jmslog.Printf("-w %d: signed in as %s", port, who.Username)
-
-	// Ctrl-C ends the tunnel rather than killing the process mid-copy, so the
-	// listener is closed and the SSH connection torn down properly -- which
-	// is also what makes jmsd log "tunnel closed" instead of leaving the
-	// operator to infer it from silence.
-	ctx, stop := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
-	defer stop()
 
 	if err := tunnel.Run(ctx, tunnel.Options{LocalPort: port, Signer: signer, Gate: gate}); err != nil {
 		return connectErr(err)
