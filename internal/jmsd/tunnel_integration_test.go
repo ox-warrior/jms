@@ -1,13 +1,17 @@
 package jmsd
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"errors"
 	"io"
+	"log"
 	"net"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -359,4 +363,96 @@ func TestTunnelServerWrongHostKeyIsRefused(t *testing.T) {
 		t.Fatal("a client pinned to a different host key still connected")
 	}
 	t.Logf("refused as expected: %v", err)
+}
+
+// The open/close pair is the only record that a user ever had a tunnel --
+// Core knows nothing about any of it. So the close line has to carry enough to
+// answer "who, when, for how long, how much" without hand-matching it against
+// the open line.
+func TestTunnelSessionLogsOpenAndCloseWithTotals(t *testing.T) {
+	ip := nonLoopbackIPv4(t)
+	echoHost, echoPort, stopEcho := startBoundEcho(t, ip)
+	defer stopEcho()
+
+	signer, authorized, _ := testTunnelKey(t)
+	rows := []sshKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
+	allow := []TunnelRule{{CIDR: ip + "/32", Ports: []int{echoPort}}}
+
+	logBuf := &syncBuffer{}
+	restore := captureLog(logBuf)
+	defer restore()
+
+	ts := newTunnelTestServer(t, rows, allow)
+	if err := ts.srv.state.RecordMFA("alice", time.Now()); err != nil {
+		t.Fatalf("record mfa: %v", err)
+	}
+
+	client := dialTunnel(t, ts.addr, ts.srv.tunnelSigner.PublicKey(), signer)
+	// Three streams, so the total is distinguishable from both 0 and 1.
+	for range 3 {
+		conn, err := client.Dial("tcp", net.JoinHostPort(echoHost, strconv.Itoa(echoPort)))
+		if err != nil {
+			t.Fatalf("open stream: %v", err)
+		}
+		conn.Close()
+	}
+	client.Close()
+	ts.stop()
+
+	// The close line is written by serveTunnelConn's deferred func on its own
+	// goroutine, which nothing joins -- so wait for it rather than reading the
+	// buffer straight away and racing it.
+	out := waitForLog(t, logBuf, "tunnel closed for alice")
+	if !strings.Contains(out, "tunnel opened for alice") {
+		t.Errorf("no open line naming the user:\n%s", out)
+	}
+	// "3 streams" is the running total, not the concurrent count -- the latter
+	// is back to zero by the time this line is written, so asserting it is what
+	// keeps the two from being confused for each other.
+	if !strings.Contains(out, "3 streams") {
+		t.Errorf("close line does not report the stream total:\n%s", out)
+	}
+}
+
+// syncBuffer is a bytes.Buffer safe for the logger's writes on one goroutine
+// and the test's reads on another.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// captureLog redirects the standard logger into w. The returned closure
+// restores it, so a failure here cannot silence logging for the rest of the
+// package.
+func captureLog(w io.Writer) func() {
+	prevOut, prevFlags := log.Writer(), log.Flags()
+	log.SetOutput(w)
+	log.SetFlags(0)
+	return func() { log.SetOutput(prevOut); log.SetFlags(prevFlags) }
+}
+
+func waitForLog(t *testing.T, buf *syncBuffer, want string) string {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if out := buf.String(); strings.Contains(out, want) {
+			return out
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	out := buf.String()
+	t.Fatalf("%q never logged within 5s; got:\n%s", want, out)
+	return out
 }

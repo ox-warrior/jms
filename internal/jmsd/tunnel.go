@@ -114,7 +114,13 @@ type tunnelSession struct {
 	conn        *ssh.ServerConn
 	remote      string
 
-	channels atomic.Int64
+	// channels is the CURRENT number of open streams, which max_channels caps
+	// and which returns to zero as they close. streamsOpened is the running
+	// total, which is what the close line reports -- "carried 83 streams" and
+	// "had 8 open at once" answer different questions, and the cap needs the
+	// second one.
+	channels      atomic.Int64
+	streamsOpened *atomic.Int64
 
 	// mu guards addrs, which the recheck ticker replaces wholesale while
 	// channel handlers read it.
@@ -309,8 +315,19 @@ func (s *Server) serveTunnelConn(ctx context.Context, nConn net.Conn) {
 			return
 		}
 	}
+	// The open/close pair is how "who had a tunnel, and when" gets answered --
+	// Core records nothing about any of this. The close line carries the
+	// duration and the stream count so the question does not require finding
+	// the matching open line and subtracting timestamps by hand, which is
+	// exactly what nobody does at 3am.
+	opened := time.Now()
+	var streams atomic.Int64
+	sess.streamsOpened = &streams
 	log.Printf("jmsd: tunnel opened for %s from %s", sess.username, sess.remote)
-	defer func() { log.Printf("jmsd: tunnel closed for %s from %s", sess.username, sess.remote) }()
+	defer func() {
+		log.Printf("jmsd: tunnel closed for %s from %s after %s, %d streams",
+			sess.username, sess.remote, time.Since(opened).Round(time.Second), streams.Load())
+	}()
 
 	connCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -465,6 +482,9 @@ func (s *Server) handleTunnelChannel(ctx context.Context, sess *tunnelSession, n
 
 	sess.channels.Add(1)
 	defer sess.channels.Add(-1)
+	if sess.streamsOpened != nil {
+		sess.streamsOpened.Add(1)
+	}
 
 	// The only record this stream will ever have: Core knows nothing about it.
 	// Both the requested name and the resolved address are logged, because
