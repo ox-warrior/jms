@@ -199,12 +199,18 @@ func (s *Server) ServeTunnel(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
+	return s.serveTunnelListener(ctx, ln)
+}
+
+// serveTunnelListener is the accept loop, split out from ServeTunnel so a test
+// can hand it a listener on an ephemeral port instead of the configured one.
+func (s *Server) serveTunnelListener(ctx context.Context, ln net.Listener) error {
 	go func() {
 		<-ctx.Done()
 		_ = ln.Close()
 	}()
 	log.Printf("jmsd: tunnel listening on %s (host key %s, %d allow rules, require_permitted_asset=%t)",
-		s.cfg.Tunnel.Listen, ssh.FingerprintSHA256(s.tunnelSigner.PublicKey()),
+		ln.Addr(), ssh.FingerprintSHA256(s.tunnelSigner.PublicKey()),
 		len(s.cfg.Tunnel.Allow), s.cfg.Tunnel.RequirePermittedAsset)
 
 	for {
