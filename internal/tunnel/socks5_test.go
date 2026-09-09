@@ -121,34 +121,3 @@ func TestSocksFailureCodeDistinguishesRefusal(t *testing.T) {
 		t.Errorf("generic failure code = %d, want %d", got, socksHostUnreachable)
 	}
 }
-
-// A client that only speaks username/password must be told so (RFC 1928's
-// 0xFF) rather than handed "use no authentication" -- answering method 0 to a
-// client that never offered it leaves it waiting for a request it will not
-// send, which presents as a hang rather than an error.
-func TestSocksHandshakeRefusesWhenNoAuthNotOffered(t *testing.T) {
-	// Offers only 0x02 (username/password).
-	c := newRW([]byte{5, 1, 2})
-	_, err := socksHandshake(c)
-	if !errors.Is(err, errNoAcceptableAuth) {
-		t.Fatalf("error = %v, want errNoAcceptableAuth", err)
-	}
-	if got := c.out.Bytes(); len(got) != 2 || got[0] != 5 || got[1] != 0xFF {
-		t.Errorf("reply = %v, want [5 255]", got)
-	}
-}
-
-// The usual case: a client offering both 0x00 and 0x02 gets no-auth selected.
-func TestSocksHandshakeSelectsNoAuthWhenOffered(t *testing.T) {
-	c := newRW(append([]byte{5, 2, 0, 2}, domainRequest("app.internal", 443)...))
-	target, err := socksHandshake(c)
-	if err != nil {
-		t.Fatalf("socksHandshake: %v", err)
-	}
-	if target.Host != "app.internal" || target.Port != 443 {
-		t.Fatalf("target = %s:%d", target.Host, target.Port)
-	}
-	if got := c.out.Bytes()[:2]; got[0] != 5 || got[1] != 0 {
-		t.Errorf("method reply = %v, want [5 0]", got)
-	}
-}

@@ -31,18 +31,9 @@ type tunnelRule struct {
 func compileTunnelPolicy(rules []TunnelRule) (*tunnelPolicy, error) {
 	out := &tunnelPolicy{}
 	for i, r := range rules {
-		ip, ipNet, err := net.ParseCIDR(r.CIDR)
+		_, ipNet, err := net.ParseCIDR(r.CIDR)
 		if err != nil {
 			return nil, fmt.Errorf("rule %d: parse cidr %q: %w", i, r.CIDR, err)
-		}
-		// ParseCIDR masks host bits away silently, so "10.0.0.5/24" becomes
-		// 10.0.0.0/24 -- a rule that reads like one host and grants a whole
-		// subnet. The allow list is meant to be argued about line by line in
-		// review, and that difference is invisible there, so it is refused
-		// rather than corrected.
-		if !ip.Equal(ipNet.IP) {
-			return nil, fmt.Errorf("rule %d: cidr %q has host bits set -- write %q for that host, or %q for the whole subnet",
-				i, r.CIDR, hostCIDR(ip), ipNet.String())
 		}
 		if len(r.Ports) == 0 {
 			return nil, fmt.Errorf("rule %d (%s): ports must not be empty", i, r.CIDR)
@@ -57,15 +48,6 @@ func compileTunnelPolicy(rules []TunnelRule) (*tunnelPolicy, error) {
 		out.rules = append(out.rules, tunnelRule{net: ipNet, ports: ports})
 	}
 	return out, nil
-}
-
-// hostCIDR is the single-address form of ip, for naming the rule an operator
-// probably meant when they left host bits set.
-func hostCIDR(ip net.IP) string {
-	if ip.To4() != nil {
-		return ip.String() + "/32"
-	}
-	return ip.String() + "/128"
 }
 
 // hardDenyReason names why an address may never be tunnelled to, whatever the

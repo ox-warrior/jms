@@ -89,24 +89,16 @@ const (
 	TunnelMFARequiredReason = "mfa_required"
 )
 
-// pipeStream copies between an accepted channel and the dialled connection
-// until both directions are done, and reports the byte counts for the audit
-// line (up = client to destination).
+// pipeStream copies between an accepted channel and the dialled connection,
+// half-closing each direction as it ends (a client that has sent its whole
+// request still has a response coming) and reporting the byte counts for the
+// audit line.
 //
-// Each direction is half-closed as it finishes, because a client that has
-// stopped reading may still be sending and tearing the channel down on the
-// first EOF truncates requests that were mid-flight.
-//
-// Waiting for both directions is what the half-close costs, and getting that
-// wait wrong is how goroutines leak. This first used a WaitGroup, which
-// deadlocked on exactly the path this design exists for: revocation closes the
-// ssh.ServerConn, the channel-side Copy returns immediately, and the goroutine
-// blocked reading an idle destination -- a held-open database connection, say
-// -- never wakes, so the Wait never returns and dst is never closed. The
-// connection was revoked and the socket outlived it anyway.
-//
-// Closing both ends once either direction finishes fixes it: that unblocks the
-// other Read, so both Copys always return.
+// Closing both ends once EITHER direction finishes is the part that matters.
+// Waiting for both first -- a WaitGroup, the obvious shape -- deadlocks on the
+// revocation path this design exists for: the channel-side Copy returns at
+// once, the other sits on a Read of an idle destination that will never see an
+// EOF, and dst is never closed.
 func pipeStream(ch ssh.Channel, dst net.Conn) (up, down int64) {
 	done := make(chan struct{})
 	go func() {
@@ -118,10 +110,6 @@ func pipeStream(ch ssh.Channel, dst net.Conn) (up, down int64) {
 	if tcp, ok := dst.(*net.TCPConn); ok {
 		_ = tcp.CloseWrite()
 	}
-	// Closing both ends before waiting is the whole point: the goroutine may
-	// be blocked on a Read that will never see an EOF (an idle destination,
-	// or a connection revoked out from under it), and only a close wakes it.
-	// Waiting first is what deadlocked.
 	_ = ch.Close()
 	_ = dst.Close()
 	<-done
@@ -427,13 +415,10 @@ func (s *Server) recheckTunnelSession(sess *tunnelSession) error {
 		return errors.New("mfa interval lapsed")
 	}
 	if s.cfg.Tunnel.RequirePermittedAsset {
-		// Same rule as the state store above, and it has to be: this one is an
-		// HTTP call to Core, so it is the MORE likely of the two to fail
-		// transiently. Treating that as a revocation meant one Core blip
-		// dropped every live tunnel at once, while a local Redis error -- far
-		// less likely -- was forgiven. The previously loaded address set stays
-		// in effect until a refresh succeeds; it is at most one tick stale,
-		// which is the same staleness it already carries by design.
+		// Same rule as the state store above, and more necessary: this is an
+		// HTTP call to Core, so it is the likelier of the two to fail
+		// transiently, and treating that as revocation dropped every live
+		// tunnel on one blip. The previous address set stays in effect.
 		if err := s.refreshTunnelAddrs(sess); err != nil {
 			debugf("tunnel recheck for %s: keeping the previous permitted-asset set: %v", sess.username, err)
 		}
@@ -484,20 +469,15 @@ func (s *Server) handleTunnelChannel(ctx context.Context, sess *tunnelSession, n
 	// TunnelMFARequiredReason.
 	user, err := s.users.Lookup(sess.fingerprint)
 	if err != nil {
-		// ConnectionFailed, not Prohibited: the client reads Prohibited as
-		// "policy said no about this destination" and reports it that way,
-		// which would send the user to read tunnel.allow when their key has
-		// actually been deactivated. Neither is retryable, but they are
-		// different problems -- and the recheck ticker is about to close the
-		// whole session anyway.
+		// ConnectionFailed, not Prohibited: the client reports Prohibited as
+		// "destination not permitted", which would send the user to read
+		// tunnel.allow when their key was actually deactivated.
 		log.Printf("jmsd: tunnel channel refused for %s: key no longer resolves: %v", sess.username, err)
 		_ = newChan.Reject(ssh.ConnectionFailed, "key no longer valid")
 		return
 	}
-	// A store error is not fatal here, for the same reason as in
-	// recheckTunnelSession -- but it is logged rather than silently passed
-	// over: an unreachable store means this gate is open, and that has to be
-	// discoverable afterwards instead of leaving no trace at all.
+	// A store error leaves this gate open, same as recheckTunnelSession -- but
+	// logged, since it has to be discoverable afterwards.
 	fresh, ferr := s.mfaFresh(user.Username)
 	if ferr != nil {
 		debugf("tunnel channel for %s: mfa gate skipped, state store unavailable: %v", sess.username, ferr)
@@ -506,21 +486,15 @@ func (s *Server) handleTunnelChannel(ctx context.Context, sess *tunnelSession, n
 		return
 	}
 
-	// Reserved by incrementing FIRST, not by comparing and incrementing later.
-	// The cap exists so one client cannot exhaust jmsd's descriptors and take
-	// the control plane down with it -- and a check-then-act version could not
-	// deliver that: every channel gets its own goroutine, so a burst all read
-	// the same stale value, and the counter stayed untouched across the DNS
-	// lookup and the 10s dial that follow. The number of sockets actually
-	// outstanding could run well past the limit.
+	// Incremented first, not compared then incremented: every channel gets its
+	// own goroutine, so a burst would all read the same stale value and all pass.
 	if n := sess.channels.Add(1); n > int64(s.cfg.Tunnel.MaxChannels) {
 		sess.channels.Add(-1)
 		log.Printf("jmsd: tunnel channel refused for %s: %d concurrent streams (max_channels)", sess.username, n-1)
 		_ = newChan.Reject(ssh.ResourceShortage, "too many concurrent streams")
 		return
 	}
-	// Released on every path from here on, including the rejections below.
-	defer sess.channels.Add(-1)
+	defer sess.channels.Add(-1) // released on every path below, rejections included
 
 	ip, err := resolveTunnelTarget(ctx, net.DefaultResolver.LookupIP, s.tunnelPolicy, data.DestAddr, port)
 	if err != nil {

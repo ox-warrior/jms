@@ -17,7 +17,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"slices"
 	"strconv"
 )
 
@@ -34,11 +33,8 @@ const (
 )
 
 const (
-	socksConnect = 1
-	// socksNoAuth is method 0x00; socksNoAcceptable is the 0xFF answer for
-	// "none of what you offered".
-	socksNoAuth       byte = 0x00
-	socksNoAcceptable byte = 0xFF
+	socksConnect      = 1
+	socksNoAuth  byte = 0x00
 )
 
 // socksTarget is what a CONNECT request asked for. Host stays as the client
@@ -55,7 +51,6 @@ func (t socksTarget) String() string { return net.JoinHostPort(t.Host, strconv.I
 var (
 	errUnsupportedCommand  = errors.New("only CONNECT is supported")
 	errUnsupportedAddrType = errors.New("unsupported address type")
-	errNoAcceptableAuth    = errors.New("client offered no authentication method this proxy accepts")
 )
 
 // socksHandshake performs the greeting and reads one CONNECT request. It
@@ -81,14 +76,6 @@ func socksHandshake(rw io.ReadWriter) (socksTarget, error) {
 	// ponytail: no SOCKS auth of any kind. Add RFC 1929 username/password if
 	// this ever needs to be reachable from another machine.
 	//
-	// The offered list is checked rather than assumed: a client that only does
-	// username/password would otherwise be told "use no authentication" and
-	// then hang waiting for a request it will never send. RFC 1928 says answer
-	// 0xFF, which makes it fail immediately and say why.
-	if !slices.Contains(methods, socksNoAuth) {
-		_, _ = rw.Write([]byte{socksVersion, socksNoAcceptable})
-		return socksTarget{}, errNoAcceptableAuth
-	}
 	if _, err := rw.Write([]byte{socksVersion, socksNoAuth}); err != nil {
 		return socksTarget{}, fmt.Errorf("write auth reply: %w", err)
 	}

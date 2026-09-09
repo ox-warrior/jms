@@ -58,12 +58,10 @@ func main() {
 	// logged: the operator asked for it by setting tunnel.enabled, and a daemon
 	// that quietly serves only half of what it was configured for is worse than
 	// one that refuses to start (same rule as inventory_db_dsn above).
-	// tunnelFailed records a tunnel listener that died so the exit status can
-	// reflect it. Closing httpServer makes ListenAndServe return
-	// ErrServerClosed -- indistinguishable from a clean shutdown -- so without
-	// this the daemon exits 0 after refusing to serve half its configuration:
-	// systemd's Restart=on-failure would not restart it and monitoring would
-	// see a normal termination.
+	// Closing httpServer below makes ListenAndServe return ErrServerClosed,
+	// which is indistinguishable from a clean shutdown -- so without this flag
+	// the daemon exits 0 after refusing to serve half its configuration, and
+	// Restart=on-failure would not restart it.
 	var tunnelFailed atomic.Bool
 	if cfg.Tunnel.Enabled {
 		tunnelErr := make(chan error, 1)

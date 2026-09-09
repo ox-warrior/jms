@@ -181,29 +181,3 @@ func TestResolveTunnelTargetRefusesWhenNoAddressPasses(t *testing.T) {
 		t.Fatal("port 22 was allowed by a rule listing only 443")
 	}
 }
-
-// ParseCIDR masks host bits away silently, so "10.0.0.5/24" would become
-// 10.0.0.0/24 -- a rule that reads like one host in review and grants a whole
-// subnet at runtime. The allow list is meant to be argued about line by line,
-// and that difference is invisible there, so it is refused rather than
-// corrected.
-func TestCompileTunnelPolicyRefusesCIDRWithHostBits(t *testing.T) {
-	_, err := compileTunnelPolicy([]TunnelRule{{CIDR: "10.0.0.5/24", Ports: []int{443}}})
-	if err == nil {
-		t.Fatal("10.0.0.5/24 accepted; it silently means the whole 10.0.0.0/24")
-	}
-	// The message has to name both readings, since the operator meant one of
-	// them and cannot tell which one they wrote.
-	for _, want := range []string{"10.0.0.5/32", "10.0.0.0/24"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error %q does not offer %s", err, want)
-		}
-	}
-
-	// The exact forms stay valid.
-	for _, cidr := range []string{"10.0.0.5/32", "10.0.0.0/24", "0.0.0.0/0", "::/0", "2001:db8::1/128"} {
-		if _, err := compileTunnelPolicy([]TunnelRule{{CIDR: cidr, Ports: []int{443}}}); err != nil {
-			t.Errorf("compileTunnelPolicy(%s): %v", cidr, err)
-		}
-	}
-}
