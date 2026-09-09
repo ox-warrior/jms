@@ -244,6 +244,14 @@ func dialTunnel(ctx context.Context, addr string, cfg *ssh.ClientConfig) (*ssh.C
 	close(stop)
 	if err != nil {
 		_ = raw.Close()
+		// Closing raw above is how the cancellation was delivered, so the
+		// handshake blames itself: "read tcp ...: use of closed network
+		// connection", which reads like a network fault the user should go
+		// investigate. It was their own Ctrl-C. Report the cause, not the
+		// symptom.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
 		return nil, err
 	}
 	// Cleared once up: a tunnel stream may sit idle for hours.
