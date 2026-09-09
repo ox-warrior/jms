@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"strconv"
 	"strings"
@@ -43,6 +44,12 @@ type Server struct {
 	// stateDesc names the state backend for the log, so "mfa verified" says
 	// where it was persisted instead of leaving that to be checked by hand.
 	stateDesc string
+	// tunnelSigner and tunnelPolicy are nil unless tunnel.enabled. Both are
+	// built in New rather than by ServeTunnel: the host key has to exist
+	// before /v1/tunnel-config can publish it, and a policy that will not
+	// compile must fail the start rather than every later connection.
+	tunnelSigner ssh.Signer
+	tunnelPolicy *tunnelPolicy
 }
 
 // AssetRow is one row of a resource listing (GET /v1/assets). It
@@ -175,7 +182,7 @@ func New(cfg Config) (*Server, error) {
 	} else {
 		log.Printf("jmsd: no inventory_db_dsn, the \"d\" panel will report no cloud metadata")
 	}
-	return &Server{
+	srv := &Server{
 		cfg:         cfg,
 		core:        core,
 		coreDB:      coreDB,
@@ -184,7 +191,20 @@ func New(cfg Config) (*Server, error) {
 		mfaFailures: newFailureTracker(mfaMaxFailures, mfaLockout),
 		state:       state,
 		stateDesc:   stateDesc,
-	}, nil
+	}
+	if cfg.Tunnel.Enabled {
+		if srv.tunnelSigner, err = loadOrCreateTunnelHostKey(cfg.Tunnel.HostKey); err != nil {
+			_ = srv.Close()
+			return nil, err
+		}
+		// Already validated by LoadConfig; compiled again here because a
+		// Server built by a test or another caller has not been through it.
+		if srv.tunnelPolicy, err = compileTunnelPolicy(cfg.Tunnel.Allow); err != nil {
+			_ = srv.Close()
+			return nil, err
+		}
+	}
+	return srv, nil
 }
 
 // Close releases the database connection and the state store. The Core HTTP
@@ -202,6 +222,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/whoami", s.requireSignature(s.handleWhoami))
 	mux.HandleFunc("/v1/k8s-config", s.requireSignature(s.handleK8sConfig))
+	mux.HandleFunc("/v1/tunnel-config", s.requireSignature(s.handleTunnelConfig))
 	mux.HandleFunc("/v1/nodes", s.requireSignature(s.handleNodes))
 	mux.HandleFunc("/v1/assets", s.requireSignature(s.handleAssets))
 	mux.HandleFunc("/v1/assets/detail", s.requireSignature(s.handleAssetDetail))
@@ -625,6 +646,62 @@ func (s *Server) handleK8sConfig(w http.ResponseWriter, r *http.Request, user *u
 	}
 	note(r, user.Username, status)
 	writeJSON(w, resp)
+}
+
+// TunnelConfigResponse is the body of GET /v1/tunnel-config: where the tunnel
+// listens and which host key it will present.
+//
+// The host key travels this way on purpose. This response has been
+// authenticated (requireSignature) and MFA-checked before it is written, so
+// pinning what it says removes the trust-on-first-use step entirely -- the
+// client can use ssh.FixedHostKey on the very first connection and never needs
+// an InsecureIgnoreHostKey, which is the single mistake that makes a tunnel
+// like this worthless (a man in the middle sees every byte of every stream).
+//
+// Empty Addr means the operator has not enabled the tunnel; the client says so
+// rather than dialling a port that is not there.
+type TunnelConfigResponse struct {
+	Addr    string `json:"addr"`
+	HostKey string `json:"host_key"`
+}
+
+// handleTunnelConfig answers with the tunnel's advertised address and host key.
+//
+// The address defaults to "the host you reached me on, at the tunnel's port"
+// rather than requiring configuration, because both planes normally run on one
+// machine and that derivation is then always right. tunnel.advertise overrides
+// it for the deployments where it is not.
+func (s *Server) handleTunnelConfig(w http.ResponseWriter, r *http.Request, user *userRecord) {
+	if !s.cfg.Tunnel.Enabled {
+		writeJSON(w, TunnelConfigResponse{})
+		return
+	}
+	addr := s.cfg.Tunnel.Advertise
+	if addr == "" {
+		addr = deriveTunnelAddr(r.Host, s.cfg.Tunnel.Listen)
+	}
+	note(r, user.Username, fmt.Sprintf("tunnel config: addr=%s", addr))
+	writeJSON(w, TunnelConfigResponse{
+		Addr:    addr,
+		HostKey: strings.TrimSpace(string(ssh.MarshalAuthorizedKey(s.tunnelSigner.PublicKey()))),
+	})
+}
+
+// deriveTunnelAddr joins the hostname the client used for the control plane
+// with the tunnel listener's port. requestHost may or may not carry a port,
+// and listen may be ":8392" or "10.0.0.1:8392"; only the port is taken from
+// it, since its host is a bind address and often 0.0.0.0, which is not
+// something a client can dial.
+func deriveTunnelAddr(requestHost, listen string) string {
+	host := requestHost
+	if h, _, err := net.SplitHostPort(requestHost); err == nil {
+		host = h
+	}
+	port := strings.TrimPrefix(listen, ":")
+	if _, p, err := net.SplitHostPort(listen); err == nil {
+		port = p
+	}
+	return net.JoinHostPort(host, port)
 }
 
 func (s *Server) handleNodes(w http.ResponseWriter, r *http.Request, user *userRecord) {

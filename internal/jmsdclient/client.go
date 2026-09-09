@@ -131,6 +131,18 @@ func (c *Client) K8sConfig(ctx context.Context) (jmsd.K8sConfigResponse, error) 
 	return get[jmsd.K8sConfigResponse](ctx, c, "/v1/k8s-config", nil)
 }
 
+// TunnelConfig fetches where jmsd's tunnel listens and which host key it will
+// present (GET /v1/tunnel-config). An empty Addr means the operator has not
+// enabled the tunnel.
+//
+// This call is also what enforces MFA for the tunnel: it runs through jmsd's
+// ordinary authorize(), so a lapsed interval comes back as MFARequiredError
+// here -- on the control plane, where connectflow.WithMFA already knows how to
+// prompt -- rather than as an opaque SSH authentication failure later.
+func (c *Client) TunnelConfig(ctx context.Context) (jmsd.TunnelConfigResponse, error) {
+	return get[jmsd.TunnelConfigResponse](ctx, c, "/v1/tunnel-config", nil)
+}
+
 // Nodes fetches the caller's permission node tree from jmsd (GET /v1/nodes).
 func (c *Client) Nodes(ctx context.Context) ([]jmsd.NodeTree, error) {
 	return get[[]jmsd.NodeTree](ctx, c, "/v1/nodes", nil)

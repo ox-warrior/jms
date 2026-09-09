@@ -48,6 +48,26 @@ func main() {
 		_ = httpServer.Close()
 	}()
 
+	// The tunnel is a second listener, not a second process: it needs the same
+	// key index, the same MFA state and the same permitted-asset queries the
+	// control plane already holds, and splitting it out would mean two copies
+	// of all three disagreeing about who is currently allowed in.
+	//
+	// A failed tunnel listener takes the whole daemon down rather than being
+	// logged: the operator asked for it by setting tunnel.enabled, and a daemon
+	// that quietly serves only half of what it was configured for is worse than
+	// one that refuses to start (same rule as inventory_db_dsn above).
+	if cfg.Tunnel.Enabled {
+		tunnelErr := make(chan error, 1)
+		go func() { tunnelErr <- srv.ServeTunnel(ctx) }()
+		go func() {
+			if err := <-tunnelErr; err != nil {
+				fmt.Fprintf(os.Stderr, "jmsd: tunnel: %v\n", err)
+				_ = httpServer.Close()
+			}
+		}()
+	}
+
 	log.Printf("jmsd listening on %s (core=%s debug=%t)", cfg.Listen, cfg.CoreHost, cfg.DebugEnabled())
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintln(os.Stderr, err)
