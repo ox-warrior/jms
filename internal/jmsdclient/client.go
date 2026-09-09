@@ -18,6 +18,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
@@ -270,7 +271,7 @@ func (c *Client) do(req *http.Request, path string, out any) error {
 	if err != nil {
 		jmslog.Printf("%s %s: FAILED after %s: %v", req.Method, path,
 			time.Since(started).Round(time.Millisecond), err)
-		return err
+		return transportError(c.baseURL, path, c.httpClient.Timeout, err)
 	}
 	defer resp.Body.Close()
 	// Only the ones that went wrong. Every browse issues several of these, so
@@ -299,6 +300,33 @@ func (c *Client) do(req *http.Request, path string, out any) error {
 		return nil
 	}
 	return json.NewDecoder(resp.Body).Decode(out)
+}
+
+// transportError turns a net/http failure into something worth reading.
+//
+// The error http.Client returns embeds the full request URL, and these URLs
+// carry a signature roughly a thousand characters long in the query string.
+// Printed as-is it buried the actual reason -- a timeout, a refused connection
+// -- past a screenful of base64, and the caller wrapping it as "resolve
+// identity" then pointed at the wrong thing entirely: nothing was wrong with
+// the identity, jmsd was simply unreachable.
+//
+// The address is kept, since a wrong jmsd_addr looks exactly like an outage and
+// is the first thing worth checking. The query string is dropped for the same
+// reason the log line above omits it.
+func transportError(baseURL, path string, timeout time.Duration, err error) error {
+	// url.Error's own message is the part carrying the signature; its wrapped
+	// Err is the part that explains the failure.
+	reason := err.Error()
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		reason = urlErr.Err.Error()
+		if urlErr.Timeout() {
+			return fmt.Errorf("jmsd at %s did not answer within %s: %s",
+				baseURL, timeout, reason)
+		}
+	}
+	return fmt.Errorf("cannot reach jmsd at %s%s: %s", baseURL, path, reason)
 }
 
 // sign builds a fresh timestamp+nonce and signs

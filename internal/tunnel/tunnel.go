@@ -29,6 +29,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -48,6 +49,11 @@ var ErrDestinationRefused = errors.New("destination not permitted by jmsd")
 // identity comes from the key -- so this is only what shows up in a packet
 // capture or a puzzled operator's log.
 const tunnelSSHUser = "jms"
+
+// tunnelDialTimeout bounds the dial and the handshake. Ten seconds is long
+// enough for a datacenter round trip and short enough that a firewalled port
+// reports itself instead of hanging.
+const tunnelDialTimeout = 10 * time.Second
 
 // Options is what Run needs. Gate carries the jmsd client, the context and
 // the TOTP prompt; Signer is the same private key that identifies this user
@@ -193,7 +199,7 @@ func (l *link) reconnect(staleGen uint64) error {
 		return fmt.Errorf("parse tunnel host key: %w", err)
 	}
 
-	client, err := ssh.Dial("tcp", cfg.Addr, &ssh.ClientConfig{
+	client, err := dialTunnel(l.gate.Ctx, cfg.Addr, &ssh.ClientConfig{
 		User: tunnelSSHUser,
 		Auth: []ssh.AuthMethod{ssh.PublicKeys(l.signer)},
 		// Pinned to what the authenticated control plane just told us. This
@@ -208,6 +214,41 @@ func (l *link) reconnect(staleGen uint64) error {
 	l.client, l.cfg, l.gen = client, cfg, l.gen+1
 	jmslog.Printf("tunnel: connected to %s (host key %s)", cfg.Addr, ssh.FingerprintSHA256(hostKey))
 	return nil
+}
+
+// dialTunnel dials and handshakes, honouring ctx and a deadline.
+//
+// ssh.Dial does neither: it blocks until the OS gives up. A tunnel port that
+// is firewalled rather than closed drops the SYN silently, so "jms -w" hung
+// with nothing on screen and Ctrl-C did nothing -- the signal cancelled a
+// context ssh.Dial was not watching. Same shape as
+// sshclient.dialAndHandshake, which solved this for the Koko dial.
+func dialTunnel(ctx context.Context, addr string, cfg *ssh.ClientConfig) (*ssh.Client, error) {
+	dialer := net.Dialer{Timeout: tunnelDialTimeout}
+	raw, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	// The handshake itself can hang too (a port that accepts and then says
+	// nothing), and it takes no context -- closing the conn is what unblocks it.
+	stop := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = raw.Close()
+		case <-stop:
+		}
+	}()
+	_ = raw.SetDeadline(time.Now().Add(tunnelDialTimeout))
+	conn, chans, reqs, err := ssh.NewClientConn(raw, addr, cfg)
+	close(stop)
+	if err != nil {
+		_ = raw.Close()
+		return nil, err
+	}
+	// Cleared once up: a tunnel stream may sit idle for hours.
+	_ = raw.SetDeadline(time.Time{})
+	return ssh.NewClient(conn, chans, reqs), nil
 }
 
 // streamOutcome is how a failed open should be treated. It is its own type
