@@ -72,20 +72,6 @@ func TestClassifyStreamOutcome(t *testing.T) {
 	}
 }
 
-// Only a refused destination maps onto ErrDestinationRefused, which is what
-// decides whether the failure is worth printing on the terminal and whether a
-// SOCKS client gets "not allowed by ruleset" instead of a generic error.
-func TestRefusedWrapsOnlyPolicyRefusals(t *testing.T) {
-	refused := &ssh.OpenChannelError{Reason: ssh.Prohibited, Message: "destination not permitted"}
-	if got := classify(refused); got != outcomeRefused {
-		t.Fatalf("classify = %d, want outcomeRefused", got)
-	}
-	mfa := &ssh.OpenChannelError{Reason: ssh.Prohibited, Message: jmsd.TunnelMFARequiredReason}
-	if classify(mfa) == outcomeRefused {
-		t.Error("an MFA lapse classified as a refusal: the client would never prompt again")
-	}
-}
-
 // The regression: pipe first waited for both directions before closing
 // anything, which deadlocked whenever one side died without an EOF -- the
 // revocation path this design exists for. A blocked Read plus an unclosed

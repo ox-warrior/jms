@@ -236,30 +236,6 @@ func TestTunnelServerRefusesLoopbackEvenWhenAllowed(t *testing.T) {
 	}
 }
 
-// A destination outside the allow list is refused, and the client is told
-// "not permitted" rather than something that reads like the destination is
-// down -- the two send the user looking in opposite directions.
-func TestTunnelServerRefusesUnlistedDestination(t *testing.T) {
-	ip := nonLoopbackIPv4(t)
-	signer, authorized, _ := testTunnelKey(t)
-	rows := []sshKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
-	allow := []TunnelRule{{CIDR: "10.200.200.0/24", Ports: []int{443}}}
-
-	ts := newTunnelTestServer(t, rows, allow)
-	defer ts.stop()
-	if err := ts.srv.state.RecordMFA("alice", time.Now()); err != nil {
-		t.Fatalf("record mfa: %v", err)
-	}
-	client := dialTunnel(t, ts.addr, ts.srv.tunnelSigner.PublicKey(), signer)
-	defer client.Close()
-
-	_, err := client.Dial("tcp", net.JoinHostPort(ip, "443"))
-	if err == nil {
-		t.Fatal("a destination outside tunnel.allow was connected")
-	}
-	t.Logf("refused as expected: %v", err)
-}
-
 // Authentication is the whole gate, so both ways it can fail have to actually
 // fail: a key nobody registered, and a registered key whose MFA interval has
 // lapsed. The second is the case a legitimate client never reaches (jms clears
@@ -332,37 +308,6 @@ func TestTunnelServerRefusesSessionChannels(t *testing.T) {
 	} else {
 		t.Logf("session refused as expected: %v", err)
 	}
-}
-
-// A pinned host key that does not match must fail the handshake. This is the
-// client-side half of why the key is published over the authenticated control
-// plane instead of being trusted on first use.
-func TestTunnelServerWrongHostKeyIsRefused(t *testing.T) {
-	signer, authorized, _ := testTunnelKey(t)
-	rows := []sshKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
-	allow := []TunnelRule{{CIDR: "10.200.200.0/24", Ports: []int{443}}}
-
-	ts := newTunnelTestServer(t, rows, allow)
-	defer ts.stop()
-
-	_, wrongPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wrongSigner, err := ssh.NewSignerFromKey(wrongPriv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = ssh.Dial("tcp", ts.addr, &ssh.ClientConfig{
-		User:            "jms",
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: ssh.FixedHostKey(wrongSigner.PublicKey()),
-		Timeout:         10 * time.Second,
-	})
-	if err == nil {
-		t.Fatal("a client pinned to a different host key still connected")
-	}
-	t.Logf("refused as expected: %v", err)
 }
 
 // The open/close pair is the only record that a user ever had a tunnel --

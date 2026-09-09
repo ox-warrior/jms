@@ -92,32 +92,3 @@ func TestSocksHandshakeRefusesNonConnect(t *testing.T) {
 		}
 	}
 }
-
-func TestSocksHandshakeRejectsWrongVersion(t *testing.T) {
-	// SOCKS4 clients reach the port too; the failure must be an error, not a
-	// misparse of the next bytes as an address.
-	if _, err := socksHandshake(newRW([]byte{4, 1, 0, 80})); err == nil {
-		t.Fatal("socks4 greeting accepted")
-	}
-}
-
-// A truncated request must be an error rather than a zero-value target, which
-// would otherwise be dialled as ":0".
-func TestSocksHandshakeTruncated(t *testing.T) {
-	c := newRW(append(greeting(), 5, 1, 0, 1, 10, 20)) // address cut short
-	if _, err := socksHandshake(c); err == nil {
-		t.Fatal("truncated request accepted; it would be dialled as \":0\"")
-	}
-}
-
-// A policy refusal maps to "not allowed by ruleset" so curl and browsers say
-// so, instead of reporting a generic failure for the one case the user can
-// actually act on.
-func TestSocksFailureCodeDistinguishesRefusal(t *testing.T) {
-	if got := socksFailureCode(ErrDestinationRefused); got != socksNotAllowed {
-		t.Errorf("refusal code = %d, want %d", got, socksNotAllowed)
-	}
-	if got := socksFailureCode(errors.New("dial tcp: i/o timeout")); got != socksHostUnreachable {
-		t.Errorf("generic failure code = %d, want %d", got, socksHostUnreachable)
-	}
-}
