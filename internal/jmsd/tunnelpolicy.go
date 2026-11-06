@@ -89,6 +89,11 @@ func (p *tunnelPolicy) allow(ip net.IP, port int) error {
 	if reason := hardDenyReason(ip); reason != "" {
 		return fmt.Errorf("%s:%d refused: %s", ip, port, reason)
 	}
+	// ponytail: no rules = any destination (hard denies above still apply).
+	// Write allow rules to narrow it once a tunnel needs a boundary.
+	if len(p.rules) == 0 {
+		return nil
+	}
 	for _, r := range p.rules {
 		if r.net.Contains(ip) {
 			if r.ports[port] {

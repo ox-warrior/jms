@@ -12,11 +12,13 @@ import (
 // distinct so a caller can report each one usefully (candidates on
 // ambiguous, "try a refresh" on not-found).
 var (
-	ErrAssetNotFound  = errors.New("no asset with that name")
-	ErrAssetAmbiguous = errors.New("multiple assets with that name")
+	ErrAssetNotFound  = errors.New("no asset with that name or IP")
+	ErrAssetAmbiguous = errors.New("multiple assets with that name or IP")
 )
 
-// matchAsset finds the one asset matching kind and name exactly.
+// matchAsset finds the one asset matching kind and name exactly. name may
+// also be the asset's address (IP), still exact: two assets on one IP are
+// reported as ambiguous like two with one name.
 // docs/PLAN.md §8.1 requires exact matching, case-sensitive, with no
 // fuzzy/prefix fallback: a headless "-c" run has nobody watching to catch a
 // wrong guess before it mints a real, audited connection ticket.
@@ -27,7 +29,7 @@ var (
 func matchAsset(assets []jmsd.AssetRow, kind jmsd.ResourceKind, name string) (jmsd.AssetRow, []jmsd.AssetRow, error) {
 	var matches []jmsd.AssetRow
 	for _, a := range assets {
-		if jmsd.MatchesKind(kind, a.Category, a.Type) && a.Name == name {
+		if jmsd.MatchesKind(kind, a.Category, a.Type) && (a.Name == name || a.Address == name) {
 			matches = append(matches, a)
 		}
 	}

@@ -197,7 +197,3 @@ func TestHidingConnectingModalWithoutWorkspace(t *testing.T) {
 	u.showConnecting("asset-one", context.CancelFunc(func() {}))
 	u.hideConnecting()
 }
-
-// Which MFA failures may be retried is tested in internal/connectflow
-// (TestMFACodeRejected), against the same five cases -- the loop that used to
-// reopen the prompt forever on a 429 lockout lives there now.

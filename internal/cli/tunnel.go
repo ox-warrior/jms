@@ -1,10 +1,8 @@
 // The "-w PORT" mode: a SOCKS5 proxy on loopback whose streams jmsd dials
 // from inside the datacenter (internal/tunnel, internal/jmsd/tunnel.go).
 //
-// Like runHeadless this never starts the TUI, and for the same reason it
-// collects a TOTP code from the tty rather than a modal. It shares that
-// prompt, promptTOTPFromTTY, so the two headless modes cannot drift apart in
-// how they ask.
+// Like runHeadless this never starts the TUI, and signs in through the same
+// newGate, so the two headless modes cannot drift apart in how they ask.
 package cli
 
 import (
@@ -25,9 +23,8 @@ import (
 // over to internal/tunnel for the lifetime of the process.
 //
 // Whoami first, exactly as runHeadless does: it costs one request and buys
-// two things -- the username every later MFA prompt is addressed to, and the
-// first pass through authorize(), so an expired MFA interval is dealt with
-// here, on the plane that can prompt, instead of surfacing as an unexplained
+// two things -- the username, and the first pass through authorize(), so a
+// lapsed sign-in is dealt with here, on the plane that can open a browser, instead of surfacing as an unexplained
 // SSH failure a moment later.
 func runTunnel(ctx context.Context, port int, jmsdAddr, identityPath string) error {
 	signer, _, err := sshclient.LoadIdentity(identityPath)
@@ -44,7 +41,7 @@ func runTunnel(ctx context.Context, port int, jmsdAddr, identityPath string) err
 	defer stop()
 
 	jc := jmsdclient.New(jmsdAddr, signer)
-	gate := &connectflow.Gate{JC: jc, Ctx: ctx, Prompt: promptTOTPFromTTY}
+	gate := newGate(ctx, jc, identityPath != "", true)
 
 	who, err := connectflow.WithMFA(gate, func() (jmsdclient.Identity, error) { return jc.Whoami(ctx) })
 	if err != nil {

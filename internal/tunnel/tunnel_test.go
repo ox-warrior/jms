@@ -14,7 +14,7 @@ import (
 // The four answers classify can give lead to four different behaviours, so a
 // misclassification is user-visible: a stream jmsd refused on policy would be
 // retried forever (a browser issues dozens of those at once), a lapsed MFA
-// interval would surface as an opaque SSH error instead of a code prompt, and
+// interval would surface as an opaque SSH error instead of a sign-in, and
 // a destination that is simply down would be reported as the tunnel being
 // broken -- sending the user to jmsd when the server is the problem.
 func TestClassifyStreamOutcome(t *testing.T) {

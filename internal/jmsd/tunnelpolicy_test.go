@@ -22,10 +22,22 @@ func mustPolicy(t *testing.T, rules ...TunnelRule) *tunnelPolicy {
 // for jmsd's own host) and loopback is where jmsd's Redis lives, which anyone
 // who can write it uses to skip any user's MFA.
 func TestTunnelPolicyHardDeniesBeatAllowAll(t *testing.T) {
-	policy := mustPolicy(t,
-		TunnelRule{CIDR: "0.0.0.0/0", Ports: []int{80, 443, 6379}},
-		TunnelRule{CIDR: "::/0", Ports: []int{80, 443, 6379}},
-	)
+	for _, policy := range []*tunnelPolicy{
+		mustPolicy(t,
+			TunnelRule{CIDR: "0.0.0.0/0", Ports: []int{80, 443, 6379}},
+			TunnelRule{CIDR: "::/0", Ports: []int{80, 443, 6379}},
+		),
+		mustPolicy(t), // no rules: everything else is open
+	} {
+		if err := policy.allow(net.ParseIP("10.20.1.2"), 3306); len(policy.rules) == 0 && err != nil {
+			t.Errorf("no rules: allow(10.20.1.2:3306) = %v, want nil", err)
+		}
+		hardDenied(t, policy)
+	}
+}
+
+func hardDenied(t *testing.T, policy *tunnelPolicy) {
+	t.Helper()
 	for _, addr := range []string{
 		"169.254.169.254", // AWS/GCP/Azure metadata
 		"127.0.0.1",       // jmsd's own localhost: Redis, control plane

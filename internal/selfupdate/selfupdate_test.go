@@ -104,15 +104,6 @@ func serveManifest(t *testing.T, body string) string {
 	return server.URL
 }
 
-// isolateCacheDir points os.UserCacheDir at a fresh directory, so the skip file
-// this test writes is not the developer's own.
-func isolateCacheDir(t *testing.T) {
-	t.Helper()
-	dir := t.TempDir()
-	t.Setenv("HOME", dir)
-	t.Setenv("XDG_CACHE_HOME", filepath.Join(dir, "cache"))
-}
-
 func TestCheck(t *testing.T) {
 	target := publishedTarget(t)
 	manifestFor := func(version, sha string) string {
@@ -149,7 +140,6 @@ func TestCheck(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			isolateCacheDir(t)
 			base := serveManifest(t, tc.manifest)
 			got, err := Check(context.Background(), base, tc.local)
 			if tc.want == "" {
@@ -171,33 +161,6 @@ func TestCheck(t *testing.T) {
 				t.Errorf("URL = %q, want it to end in /%s/jms", got.URL, target)
 			}
 		})
-	}
-}
-
-// A skip has to survive the launch that recorded it and no further than the
-// version it named. Silencing the next release too would opt the user out of
-// updates permanently, which is not what the key they pressed promised.
-func TestSkipSilencesOnlyTheSkippedVersion(t *testing.T) {
-	isolateCacheDir(t)
-	target := publishedTarget(t)
-	manifest := fmt.Sprintf(`{"version":"0.1.3","targets":{%q:{"sha256":"aa"}}}`, target)
-	base := serveManifest(t, manifest)
-
-	release, err := Check(context.Background(), base, "0.1.2")
-	if err != nil || release == nil {
-		t.Fatalf("Check offered nothing before the skip (err=%v)", err)
-	}
-	if err := Skip(release.Version); err != nil {
-		t.Fatalf("Skip: %v", err)
-	}
-	if got, _ := Check(context.Background(), base, "0.1.2"); got != nil {
-		t.Fatalf("Check offered %+v after it was skipped", got)
-	}
-
-	// The next release must get through.
-	next := fmt.Sprintf(`{"version":"0.1.4","targets":{%q:{"sha256":"aa"}}}`, target)
-	if got, err := Check(context.Background(), serveManifest(t, next), "0.1.2"); got == nil {
-		t.Fatalf("skipping 0.1.3 also silenced 0.1.4 (err=%v)", err)
 	}
 }
 
@@ -309,7 +272,6 @@ func assertNoLeftovers(t *testing.T, dir string) {
 // The error has to be distinguishable, because it is the one check failure the
 // user has to be told about rather than have swallowed.
 func TestCheckRefusesToOfferTheVersionItJustInstalled(t *testing.T) {
-	isolateCacheDir(t)
 	target := publishedTarget(t)
 	base := serveManifest(t, fmt.Sprintf(`{"version":"0.1.3","targets":{%q:{"sha256":"aa"}}}`, target))
 

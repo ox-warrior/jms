@@ -416,7 +416,7 @@ func (w *Workspace) ApplyLoad(query ResourceQuery, nodes []ScopeNode, rows []Res
 // flight -- connectResource runs asynchronously with no modal covering every
 // stage, so without this a stray Enter (or a click elsewhere followed by
 // Enter) can launch a second concurrent connectResource for a different
-// asset, racing the first over the shared "picker"/"mfa-prompt" page names.
+// asset, racing the first over the shared "picker"/"google-signin" page names.
 func (w *Workspace) openSelectedResource(row, _ int) {
 	if row < 1 || row > len(w.visible) || w.actions.OpenResource == nil {
 		return

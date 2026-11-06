@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 
+	"golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
 )
 
@@ -37,11 +38,8 @@ const (
 
 // Config holds jmsd's own runtime settings, loaded from a YAML file rather
 // than argv so its secrets never show up in `ps`. The file should be owned by
-// whichever user runs jmsd and mode 0600 -- it holds the Access Key, database
-// DSN, and Core's SECRET_KEY in plaintext. SECRET_KEY in particular is
-// JumpServer's master key for every EncryptField-protected column in the
-// database, not just the ones jmsd reads -- keep the DB account read-only and
-// this file locked down (see docs/PLAN.md §7.2).
+// whichever user runs jmsd and mode 0600 -- it holds the Access Key and the
+// database DSN in plaintext. Keep the DB account read-only.
 type Config struct {
 	// Listen is the local address jmsd's HTTP API binds to, e.g. ":8391".
 	Listen string `yaml:"listen"`
@@ -53,8 +51,7 @@ type Config struct {
 	AccessKeyID     string `yaml:"access_key_id"`
 	AccessKeySecret string `yaml:"access_key_secret"`
 	// CoreDBDSN points at Core's own PostgreSQL database, which jmsd reads
-	// (never writes) to verify a caller's SSH signature and TOTP code -- see
-	// docs/PLAN.md §7.2. Format:
+	// (never writes) for the list of active users -- see activeUsers. Format:
 	// "postgres://user:pass@host:5432/jumpserver?sslmode=disable".
 	CoreDBDSN string `yaml:"core_db_dsn"`
 	// InventoryDBDSN points at the MySQL holding cloud-sync's
@@ -67,12 +64,23 @@ type Config struct {
 	// off by the server's offset. Format:
 	// "user:pass@tcp(host:3306)/cloud_meta?parseTime=true&loc=UTC".
 	InventoryDBDSN string `yaml:"inventory_db_dsn"`
-	// SecretKey is Core's Django SECRET_KEY, copied verbatim from Core's own
-	// config.txt. It decrypts the EncryptField columns jmsd reads.
-	SecretKey string `yaml:"secret_key"`
-	// MFAIntervalDays is how often a user must re-verify MFA. Defaults to
-	// DefaultMFAIntervalDays when zero.
+	// MFAIntervalDays is how long a Google sign-in keeps a key bound, i.e.
+	// how often a user signs in again. Defaults to DefaultMFAIntervalDays
+	// when zero. The name predates Google sign-in and is kept so existing
+	// configs keep meaning the same thing.
 	MFAIntervalDays int `yaml:"mfa_interval_days"`
+	// ServiceKeys are keys held by machines, such as the AI agent in the
+	// sre-triage environment, which cannot open a browser to sign in. Each
+	// acts as its JumpServer user permanently; what it can reach is that
+	// user's grants, which is where it should be held to read-only accounts.
+	ServiceKeys []ServiceKey `yaml:"service_keys"`
+	// AuditES is the Elasticsearch base URL audit events are bulk-written to
+	// (index jmsd-audit-YYYY-MM-DD, 30 days; see audit.go). Empty: no audit
+	// beyond the log lines jmsd prints anyway.
+	AuditES string `yaml:"audit_es"`
+	// Google is how people sign in: jms's key is bound to the JumpServer
+	// user whose email matches the Google account. Required. See googleauth.go.
+	Google GoogleConfig `yaml:"google"`
 	// K8s is the office network's front door to Koko's :5002 k8s proxy.
 	// Every k8s connection requires it because k9s always runs locally.
 	K8s K8sProxyConfig `yaml:"k8s"`
@@ -88,6 +96,23 @@ type Config struct {
 	// so a restart no longer resets every user's MFA clock. Left unset, jmsd
 	// keeps the in-memory store and its restart-loses-everything behaviour.
 	Redis RedisConfig `yaml:"redis"`
+}
+
+// ServiceKey is one service_keys entry: a public key, authorized_keys form,
+// and the JumpServer username it acts as.
+type ServiceKey struct {
+	User      string `yaml:"user"`
+	PublicKey string `yaml:"public_key"`
+}
+
+// GoogleConfig is the OAuth client jms signs in with. ClientID must be the
+// same "Desktop app" client compiled into jms: ID tokens issued to any other
+// client are refused.
+type GoogleConfig struct {
+	ClientID string `yaml:"client_id"`
+	// HostedDomain is the Workspace domain an account must belong to, e.g.
+	// "example.com".
+	HostedDomain string `yaml:"hosted_domain"`
 }
 
 type K8sProxyConfig struct {
@@ -187,7 +212,7 @@ func LoadConfig(path string) (Config, error) {
 		{"access_key_id", cfg.AccessKeyID},
 		{"access_key_secret", cfg.AccessKeySecret},
 		{"core_db_dsn", cfg.CoreDBDSN},
-		{"secret_key", cfg.SecretKey},
+		{"google.client_id", cfg.Google.ClientID},
 	} {
 		if required.value == "" {
 			return cfg, fmt.Errorf("%s: %s is required", path, required.name)
@@ -200,6 +225,17 @@ func LoadConfig(path string) (Config, error) {
 	if cfg.MFAIntervalDays == 0 {
 		cfg.MFAIntervalDays = DefaultMFAIntervalDays
 	}
+	// Required rather than defaulted: without it, any Google account at all
+	// -- a personal one included -- would pass, as long as its email matched.
+	if cfg.Google.HostedDomain == "" {
+		return cfg, fmt.Errorf("%s: google.hosted_domain is required", path)
+	}
+	for _, k := range cfg.ServiceKeys {
+		if _, _, _, _, err := ssh.ParseAuthorizedKey([]byte(k.PublicKey)); err != nil || k.User == "" {
+			return cfg, fmt.Errorf("%s: service_keys: each entry needs user and public_key "+
+				"(a line from the .pub file): %q", path, k.User)
+		}
+	}
 	if cfg.Tunnel.Enabled {
 		if cfg.Tunnel.Listen == "" {
 			cfg.Tunnel.Listen = DefaultTunnelListen
@@ -209,10 +245,6 @@ func LoadConfig(path string) (Config, error) {
 		}
 		if cfg.Tunnel.HostKey == "" {
 			return cfg, fmt.Errorf("%s: tunnel.host_key is required when tunnel.enabled", path)
-		}
-		if len(cfg.Tunnel.Allow) == 0 {
-			return cfg, fmt.Errorf("%s: tunnel.allow must list at least one rule when tunnel.enabled "+
-				"-- an empty list would mean every destination", path)
 		}
 		// Compiled here so a typo'd CIDR fails the start rather than every
 		// tunnel connection: a policy that cannot be built is a policy that

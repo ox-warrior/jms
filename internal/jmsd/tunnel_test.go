@@ -35,11 +35,9 @@ func TestTunnelHostKeyIsStableAcrossLoads(t *testing.T) {
 	}
 }
 
-// Turning the tunnel on without an allow list must fail the start. The tunnel
-// is the one jmsd feature Core records nothing about, so "enabled with no
-// rules" reading as "every destination" would be the quiet way to hand raw
-// network reachability to anyone who can authenticate.
-func TestLoadConfigRefusesUnboundedTunnel(t *testing.T) {
+// A tunnel without an allow list starts and reaches anything but the hard
+// denies; a malformed config still fails the start.
+func TestLoadConfigTunnel(t *testing.T) {
 	dir := t.TempDir()
 	keyPath := filepath.Join(dir, "host_key")
 	if _, err := loadOrCreateTunnelHostKey(keyPath); err != nil {
@@ -52,7 +50,7 @@ func TestLoadConfigRefusesUnboundedTunnel(t *testing.T) {
 access_key_id: "id"
 access_key_secret: "secret"
 core_db_dsn: "postgres://u:p@h:5432/db?sslmode=disable"
-secret_key: "0123456789012345678901234567890123456789012345678901234567890123"
+google: {client_id: "c", hosted_domain: "example.com"}
 ` + tunnel
 		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 			t.Fatalf("write config: %v", err)
@@ -75,7 +73,6 @@ secret_key: "0123456789012345678901234567890123456789012345678901234567890123"
   enabled: true
   host_key: "` + keyPath + `"
 `,
-			wantErr: true,
 		},
 		{
 			name: "enabled with no host key",

@@ -15,6 +15,7 @@ import (
 	"github.com/leiyupeng/jumpserver-cli/internal/clipboard"
 	"github.com/leiyupeng/jumpserver-cli/internal/config"
 	"github.com/leiyupeng/jumpserver-cli/internal/connectflow"
+	"github.com/leiyupeng/jumpserver-cli/internal/googlelogin"
 	"github.com/leiyupeng/jumpserver-cli/internal/jmsd"
 	"github.com/leiyupeng/jumpserver-cli/internal/jmsdclient"
 	"github.com/leiyupeng/jumpserver-cli/internal/jmslog"
@@ -33,6 +34,8 @@ type Options struct {
 	// regardless.
 	CacheTTL time.Duration
 	K9sPath  string
+	// Google is the client a lapsed or first sign-in runs in the browser.
+	Google googlelogin.Client
 	// InitialKind pre-selects a resource kind at launch -- the "-c TYPE" shortcut
 	// with no name (docs/PLAN.md §8.1). Empty means the ordinary "all" start.
 	InitialKind ResourceKind

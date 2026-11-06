@@ -100,3 +100,8 @@ func ResourceKindTokens() []string {
 	}
 	return tokens
 }
+
+// QueryProtocols are the protocols whose assets jmsd runs a query for
+// (POST /v1/query): for these, jms's "-- command" is a query, not a shell
+// command. Shared so the two sides cannot disagree about which they are.
+var QueryProtocols = []string{"mysql", "postgresql", "redis", "mongodb"}

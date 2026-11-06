@@ -15,14 +15,14 @@
 ```mermaid
 flowchart LR
     subgraph client["用户本机"]
-        key["~/.ssh/id_ed25519\n(本地私钥，只签名不上传)"]
+        key["本机钥匙 device_key\n(jms 自动生成，只签名不上传)"]
         jms["jms\n(TUI 客户端)"]
         k9s["K9s\n(K8s 资产)"]
     end
 
     subgraph ctrl["内网控制面"]
         jmsd["jmsd\n(控制服务)"]
-        redis[("Redis\nMFA 状态 / nonce，可选")]
+        redis[("Redis\n钥匙绑定 / nonce，可选")]
     end
 
     subgraph js["JumpServer"]
@@ -34,9 +34,9 @@ flowchart LR
     target["目标资产\n服务器 / 数据库 / K8s"]
 
     key -.签名 fp·ts·nonce·sig.-> jms
-    jms -- "① 身份反查 · MFA · 查资产\nHTTP + SSH 签名" --> jmsd
-    jmsd -- "只读 SQL：验签 / TOTP" --> pg
-    jmsd -. "MFA 时间戳 / 防重放 nonce" .-> redis
+    jms -- "① Google 登录绑钥匙 · 查资产\nHTTP + 钥匙签名" --> jmsd
+    jmsd -- "只读 SQL：启用用户列表" --> pg
+    jmsd -. "钥匙绑定 / 防重放 nonce" .-> redis
     jmsd -- "② Access Key 签名\n权限树 / 出票" --> core
     core --- pg
     jms -- "③ ssh JMS-<票号> / <票值>" --> koko
@@ -52,8 +52,8 @@ flowchart LR
 起点是三条硬约束，合起来唯一确定了这个架构：
 
 ```
-不输密码 ⟹ 身份只能靠 SSH 私钥证明
-        ⟹ 验证公钥需要 JumpServer 侧的高权限凭据
+不输密码 ⟹ 身份靠 Google 登录绑定的本机钥匙证明
+        ⟹ 出票、查权限需要 JumpServer 侧的高权限凭据
         ⟹ 这个凭据不能下发到用户电脑
         ⟹ 必须有一个独立的服务端持有它（jmsd）
 ```
@@ -62,25 +62,25 @@ flowchart LR
 
 | # | 谁到谁 | 认证方式 | 目标资产密码是否可见 |
 |---|---|---|---|
-| ① | `jms` → `jmsd` | 本地 SSH 私钥对 `fingerprint\|ts\|nonce` 签名 | 否 |
+| ① | `jms` → `jmsd` | 本机钥匙对 `fingerprint\|ts\|nonce` 签名（钥匙由 Google 登录绑定到用户） | 否 |
 | ② | `jmsd` → JumpServer Core | `jmsd` 服务账号的 Access Key 签名（`SigAuth`） | 否 |
 | ③ | `jms` → Koko | 用户名 `JMS-<票号>`，密码 `<票值>`，程序自动填 | 否（票据不含 `Account.Secret`） |
 | ④ | Koko → 目标资产 | 票据内的 `Account.Secret` | Koko 持有，`jms`/`jmsd` 均不参与 |
 
 几个关键取舍：
 
-- **身份 = SSH 公钥指纹，不是用户名/密码**：`jms` 本地用私钥签名，`jmsd` 反查这把公钥登记在哪个用户名下，省掉登录页和一切输入框。
-- **验签在数据库层做，不走 REST API**：JumpServer 的公钥登录后端要求 service account 签名，而 service account 这条路全网无文档、官方 SDK 和 Koko 自己都不用（`docs/PLAN.md` §5.B）。`jmsd` 改用「只读 DB 账号 + Core 的 `SECRET_KEY`」直接读取并本地解密 `authentication_sshkey`/`otp_secret_key`，绕开这个被堵死的入口。
+- **身份 = 本机钥匙，由 Google 登录绑定**：`jms` 自动生成一把钥匙，浏览器登录 Google 后 `jmsd` 按邮箱找到 JumpServer 用户（`users_user.email`），把钥匙绑给他，`mfa_interval_days` 天后过期。没有登录页、用户名/密码、验证码，也不用往 JumpServer 登记公钥。
+- **只读 DB 只拿启用用户列表**：`jmsd` 读 `users_user` 的 `id/username/email`（`is_active = true`），用户在 JumpServer 里被禁用，他的钥匙就失效。
 - **票据制，密码不出 Core**：`jmsd` 用最小权限服务账号换一张 `ConnectTokenInfo`（只有 `{ID, Value, ExpireTime, AccountName, Protocol}`），`jms` 拿票号/票值当 SSH 用户名/密码连 Koko；目标资产的真实密码只在 Core→Koko 之间流动，两个自研组件都碰不到。
 - **无 session，每请求现场签名**：不引入一个可被窃取的会话令牌，改成每次请求带 `{fp, ts, nonce, sig}`，30 秒窗口防重放。
 - **资产全量拉取 + 全部在客户端过滤**：`/v1/assets` 不接受节点过滤参数，一次性返回该用户全部有权限的资产；分类、`/` 搜索、左侧树的每节点计数都在本地对同一份数据算——按节点分别查询会让其他节点的计数归零，这是已经踩过的坑。
-- **资产缓存 12 小时，鉴权永不缓存**：资产列表和节点树缓存在本地文件里换取秒开；但 `/v1/whoami`（身份+MFA 新鲜度）和 `/v1/connections`（出票）永远实时请求。
-- **公钥指纹索引缓存 30 秒**：`authentication_sshkey.public_key` 用随机 nonce 的 AES-256-GCM 加密，同一把公钥每次密文都不同，建不了索引，只能整表扫描逐把解密。不缓存的话，一个签名乱填的伪造请求就能让 `jmsd` 对 Core 的生产库跑一次全表解密；缓存后伪造请求只值一次内存查找。
+- **资产缓存 12 小时，鉴权永不缓存**：资产列表和节点树缓存在本地文件里换取秒开；但 `/v1/whoami`（身份 + 登录是否过期）和 `/v1/connections`（出票）永远实时请求。
+- **启用用户列表缓存 30 秒**：认人必须在验签之前（不知道是谁就不知道拿哪把公钥验），不缓存的话一个签名乱填的伪造请求就能让 `jmsd` 查一次 Core 的生产库；缓存后只值一次内存查找。代价是禁用用户最多 30 秒后生效。
 
 ### 核心功能
 
-- 零输入登录：本地 SSH 私钥指纹反查身份，不用输用户名/密码
-- MFA 周期由 `jmsd` 自己控制（默认 10 天），与 JumpServer 全局 MFA 策略解耦；连续输错 5 次验证码锁定 15 分钟
+- Google 登录：jms 在本机自动生成一把钥匙，浏览器里登录一次 Google 就绑定到你的 JumpServer 用户，不用准备 SSH 私钥、不用输用户名/密码/验证码
+- 登录有效期由 `jmsd` 控制（默认 10 天），到期再登录一次 Google
 - K9s 风格 TUI：`:` 命令输入、`/` 搜索、按云资源分类切换（`:all`/`:ec2`/`:rds`/`:redis`/`:k8s`），两者可叠加且持续生效
 - 收藏（`y` 键）与最近连接，直接读写 JumpServer 后端数据，和网页控制台双向同步
 - 云主机 Describe（`d` 键）：机型、CPU/内存、磁盘、安全组、VPC、计费方式、标签，来自 cloud-sync 落库的云元数据
@@ -96,9 +96,7 @@ flowchart LR
 
 | JumpServer / Koko 组件 | 用途 |
 |---|---|
-| `authentication_sshkey` 表（`AES-256-GCM` 加密，随机 nonce） | `jmsd` 直读并本地解密，做 SSH 公钥指纹反查与逐把验签 |
-| `users_user.otp_secret_key` | `jmsd` 本地校验 TOTP（`pyotp` 同参数：SHA1/6 位/30 秒），实现自控 MFA 间隔 |
-| Core 的 Django `SECRET_KEY` | 派生 AES-256-GCM 密钥，解密上面两个加密字段 |
+| `users_user`（`id/username/email`，`is_active`） | `jmsd` 只读，Google 邮箱 → JumpServer 用户；禁用即失效 |
 | `perms/users/{id}/nodes`、`perms/users/{id}/assets`（sdk-go `GetUserNodes`/`GetAllUserPermsAssets`） | 拉取用户权限树与全部有权限的资产（含 `nodes` 归属，用于左树计数） |
 | `authentication.add_superconnectiontoken`（sdk-go `CreateSuperConnectToken`） | `jmsd` 出票，返回不含密码的 `ConnectTokenInfo` |
 | RBAC 自定义最小权限角色 | `jmsd` 服务账号只拿 `perms.view_userassets` + `authentication.add_superconnectiontoken`，明确不给 `authentication.view_superconnectiontokensecret` |
@@ -113,9 +111,9 @@ flowchart LR
 
 - 服务器地址和 jmsd 地址都可以写进配置文件，不用每次带参数；命令行参数优先，见下方「客户端配置」
 - `jms -w 9090` 起一个 SOCKS5，流量从 `jmsd` 那台机器拨出去。**默认在 jmsd 侧关闭**，开了之后 Core 里不留任何记录——详见下方「隧道」
-- **不用输用户名**：启动即用本地 SSH 私钥的公钥指纹向 jmsd 反查身份，见下
-- SSH 私钥按顺序查找：显式指定 → `~/.ssh/id_rsa` → `~/.ssh/id_ed25519`，不读 `ssh-agent`
-- 启动不会直接连 Koko——只在真正选中资产连接、或 jmsd 要求验 MFA 时才会跟 JumpServer 打交道，见下
+- **不用输用户名**：启动即用 jms 自己的本机钥匙向 jmsd 反查身份，没登录过或过期了就打开浏览器登录 Google，见下
+- 本机钥匙在 `~/Library/Application Support/jms/device_key`（Linux 是 `~/.config/jms/device_key`），首次运行自动生成；`--identity` 指定私钥只给服务器上的程序用（见 jmsd 的 `service_keys`）
+- 启动不会直接连 Koko——只在真正选中资产连接时才会跟 JumpServer 打交道，见下
 - `:q`（`:quit` / `:exit` 同义）退出，和 `Ctrl+C` 完全等价——走的就是 tview 事件循环里 `Ctrl+C` 调的那个 `Stop()`，日志照常收尾。`:` 本来就是这个客户端的命令入口，从 vim 或 k9s 过来的人第一反应就是 `:q`。打错的词（`:qq`、`:q!`）什么都不做，不会把会话关掉
 - 已实现 `:all`（默认，不过滤）、`:ec2`（含 AWS EC2 与阿里云 ECS）、`:rds`、`:redis`、`:k8s` 按云资源分类切换、`/` 过滤、按 Enter 选中资产直连（见下）；这几个分类之前是空实现——切哪个看到的都是同一批资产——本轮才第一次真正按 JumpServer 的 `category`/`type` 过滤
 - 资源表最后一列是 `SOURCE TYPE`，标出每行是 `ec2` / `rds` / `redis` / `k8s`——在 `:all` 视图下这是唯一能一眼看出「这是台机器还是个库」的地方，之前得靠名字猜。这一列和 `:` 分类用的是同一套判定，所以标成 `redis` 的行一定就是 `:redis` 会列出来的行。四类之外的资产（比如 `web`）直接显示 JumpServer 的 category，不显示占位横杠——横杠会被读成「数据缺失」，而 category 本来就说明了它是什么
@@ -136,7 +134,7 @@ flowchart LR
 - 左侧 Scope 树跟着当前分类和 `/` 搜索走：子树里一个匹配资源都没有的节点直接从树上消失，剩下的节点名后面标匹配数（`ack (4)`）。计数完全在客户端用已加载的资产算，**不会为此多发任何请求**——每个资产本来就带着自己的节点归属。当前选中的节点即使变空也会保留、置灰，这样切分类不会把光标扯走
 - **本地缓存**：首次拉到的资产列表和节点树会在本地存一份，带时间戳。下次启动如果没超过 12 小时就直接用缓存，**一个网络请求都不发，秒开**；超过 12 小时才重新拉。按 `r` 永远绕过缓存、强制重读。用 `--cache-ttl` 调整（如 `--cache-ttl 1h`），`--cache-ttl 0` 关掉
 - 缓存放在 `<用户缓存目录>/jms/`（macOS `~/Library/Caches/jms/`，Linux `~/.cache/jms/`），权限 `0600`，**按「服务器 + 用户名」分文件**——同一台机器上两个人的可见资产不一样，绝不能互相串。文件里存的是资产名和地址，删掉它只会让下次启动慢一点。收藏和最近**不缓存**：它们在 Core 里、只要一次请求，而「最近」过期 12 小时比慢一点更糟
-- 缓存不影响 MFA：启动时的 `/v1/whoami` 从不走缓存，10 天的 MFA 检查照常在启动时触发；真正连机器时的 `/v1/connections` 也永远是实时鉴权
+- 缓存不影响登录：启动时的 `/v1/whoami` 从不走缓存，10 天的登录检查照常在启动时触发；真正连机器时的 `/v1/connections` 也永远是实时鉴权
 - **资产只在启动和按 `r` 时整体拉一次，之后节点、分类、搜索全是本地过滤**，所以在树上移动光标是瞬时的、不产生任何网络请求。这一条是必须的：树上的计数要在整棵树的范围内统计才有导航价值，而按节点去拉子集会让**其他节点的计数全部归零**——之前就是这个 bug，光标一移到某个叶子上，兄弟节点直接从树上消失、根节点计数也跟着缩水
 - **收藏与最近**：左侧三个虚拟入口（★ Favorites / ◷ Recent / ● All permitted）之前是空占位——点哪个都显示全部资产——现在真的能用了。在资源表上按 `y` 收藏/取消收藏当前行，收藏的行名字前面会带 `★`。三个入口都带匹配数，即使是 0 也保留显示（空的 Favorites 正是用户发现「有收藏这功能」的地方），并且都能和分类、`/` 搜索叠加——站在 Recent 里切 `:rds`，就是「最近连过的数据库」
 - **收藏和最近都存在 JumpServer 里，本地不落任何文件**：所以换台机器跑 `jms`，收藏跟着走；在网页控制台点的收藏，`jms` 里也看得到，反之亦然。`◷ Recent` 直接来自 Core 的会话历史，因此**从网页端或直连 Koko 连的机器也会算进去**，不只是 `jms` 连的；只统计成功建立的会话，同一台机器取最近一次、不重复列出
@@ -161,7 +159,7 @@ flowchart LR
   - **元数据库挂了只会让面板变空，不会影响资产列表**：那张表跟登录、鉴权、连接都没关系，为它把整个工具搞不可用是笔烂账
 - 选中资产按 Enter：账号/协议只有一个自动选，协议里有 `ssh` 时默认选 `ssh`（不弹框），否则多个才弹选择框；K8s 资产始终在用户电脑运行 K9s，不提供远程 shell 或自动回退
 - **双击复制到剪贴板，按列决定复制什么**：双击 NAME 复制机器名，双击 ADDRESS 复制地址，双击 SOURCE TYPE 也是复制机器名（复制个 `ec2` 没意义）。主要是给 `jms -c "ec2 <名字>"` 用的：那条命令是精确匹配，名字必须一字不差。复制的是**底层数据里的完整值**，不是屏幕上那串——NAME 和 ADDRESS 在窄终端下都会被截断成 `prod-web-ap…`，鼠标框选只能拿到截断后的，拿去连必然失败。双击不会触发连接（连接只认 Enter），滚轮和单击选行也完全不受影响。成功会在状态栏用紫色回显复制了什么，失败用红色如实报错，不会假装成功。**仅 macOS**（走 `pbcopy`）：Linux 的剪贴板需要 `xclip`/`wl-copy` 这类不一定装了的外部程序，与其三条路径三种失败方式，不如只做一条永远对的
-- **退出终端回到界面时，光标还在原来那一栏**：tview 关掉一个弹层后会把焦点交给下面那页的默认子元素，而资源页的默认子元素永远是左侧 Scope 树——所以关掉任何弹框（账号选择、协议选择、MFA 输入、错误框）都会把光标扔到左边。这个现象会延迟暴露：弹框关掉时会话马上就开始了，等你退出终端回到界面才看见光标跑了，所以看起来像是「退出终端导致的」。现在所有弹层的关闭都走同一个入口，关掉之前先记下你在哪一栏、关掉之后放回去（只在焦点确实掉进资源页时才放，别的弹层还开着就不抢）
+- **退出终端回到界面时，光标还在原来那一栏**：tview 关掉一个弹层后会把焦点交给下面那页的默认子元素，而资源页的默认子元素永远是左侧 Scope 树——所以关掉任何弹框（账号选择、协议选择、Google 登录、错误框）都会把光标扔到左边。这个现象会延迟暴露：弹框关掉时会话马上就开始了，等你退出终端回到界面才看见光标跑了，所以看起来像是「退出终端导致的」。现在所有弹层的关闭都走同一个入口，关掉之前先记下你在哪一栏、关掉之后放回去（只在焦点确实掉进资源页时才放，别的弹层还开着就不抢）
 
 ## 安装
 
@@ -184,29 +182,16 @@ curl -fsSL "$JMS_CDN_BASE/install.sh" | bash
 
 `$JMS_CDN_BASE` 是你们自己的发布地址（`scripts/release.sh` 上传到的那个）。本仓库不内置任何发布源，源码里的默认值是 `https://dist.example.com/jms`——上传时 `release.sh` 会把真实地址替换进 CDN 上那一份 `install.sh`，所以从 CDN curl 下来的那份不需要设环境变量，直接跑就行。
 
-装到 `/usr/local/bin/jms`（没有写权限就用 `sudo bash` 跑上面这条）。Linux arm64 暂未提供预编译二进制，需自行从源码构建，见下。
+**不要加 sudo**：jms 装在 `~/.jms/bin/jms`，`/usr/local/bin/jms` 是指过去的软链接，只有建这个链接时脚本会自己要一次密码。这样二进制和配置都归你自己，之后的强制更新不需要 sudo。（加了 sudo 也能装对，脚本会把文件交还给你。）
 
-### 自动更新
+### 自动更新（强制）
 
-装完之后不用再手工跑那条 curl。`jms` 每次启动会问一下 CDN 有没有新版，有就在 TUI 起来之前提示一次：
+装完之后不用再手工跑那条 curl。`jms` 每次启动（TUI、`-c`、`-w` 都算）先问一下 CDN 有没有新版，有就**直接升级，不询问**：下载、校验 sha256、原子替换当前二进制，然后带着原来的命令行参数重启，落到的还是你本来要去的地方。
 
-```
-jms 0.1.3 可用（当前 0.1.2）
-  [Enter] 更新并重启    [s] 跳过该版本    [n] 这次不用
-```
-
-- **Enter** —— 下载、校验 sha256、原子替换掉当前这个二进制，然后带着原来的命令行参数重启。整个过程通常 20 毫秒以内，落到的还是你本来要去的界面
-- **s** —— 跳过**这一个版本**，记在 `~/Library/Caches/jms/update.json`（Linux `~/.cache/jms/update.json`）。下个版本发出来还是会问
-- **n** 或其他任何键 —— 这次不管，下次启动再问
-
-几件不会发生的事：
-
-- **`-c "type name"` 那条快捷路径永远不提示。** 那是给脚本用的，问一句就等于挂在那里。stdin 不是终端时（管道、cron、CI）同理，一律跳过
-- **不会自动装。** 没按 Enter 就什么都不动，也没有后台静默替换
-- **不会盖掉源码构建。** 版本号是逐段比大小而不是判等，本地版本高于或等于 CDN 就完全安静——所以发版前把 `internal/version/version.go` 的版本号 bump 上去，整个开发窗口里自己机器上的构建都不会被线上的旧版盖掉
-- **`/usr/local/bin` 不可写时不会去提权。** 它会打一行手工更新的 curl 命令，然后正常启动
-
-网络不通、CDN 挂了、平台没有对应的发布版本——全部静默跳过，启动最多为此等 2 秒。想看为什么没提示，把日志级别调成 `debug`。彻底关掉：配置文件里写 `disable_update_check: true`。
+- **升级失败就不启动**，打印原因并提示联系 leiyupeng。最常见的是老的装法把 jms 装成了 root 的文件，会附上一行 `curl … | bash`，重装一次就好
+- **连不上 CDN 照常启动**（离开公司网络、CDN 挂了），启动最多为此等 2 秒
+- **不会盖掉源码构建**：版本号逐段比大小，本地版本高于或等于 CDN 就不动；`dev` 构建永远不升级
+- 发版排练可以在配置文件里设 `update_url` 指到临时桶，不影响别人
 
 ### 发布新版本（维护者用）
 
@@ -221,7 +206,7 @@ scripts/release.sh 1.2.3 -y           # 跳过确认，CI 里用
 scripts/release.sh 1.2.3 --build-only # 只编译到 dist/，不接触 S3，本地验证用
 ```
 
-**版本号是必填参数**，通过 `-ldflags` 注入 `internal/version.Version`，源码里不再有手改的常量（那个常量曾经是「发版忘了改一行 → 二进制自称旧版本 → 更新提示要么不弹要么装完还一直弹」的来源）。脚本会校验它是 `X.Y.Z` 形式：客户端按 semver 比大小，带 `v` 前缀或 `-rc` 后缀的解析不了，会被当成「读不懂，那就不提示」静默掉。目标平台列表是脚本里的 `TARGETS` 数组，新增一个架构只需要加一行 `"GOOS GOARCH s3目录名"`；目录名沿用 `mfmc` 的老命名（`darwin`=macOS arm64，`amd`=macOS x86_64，`linux`=Linux x86_64——历史遗留，新增时跟着这个习惯就行）。上传完会逐个 `curl` 一遍 CDN 确认 HTTP 200，不会发布了却没验证能不能下载。
+**版本号是必填参数**，通过 `-ldflags` 注入 `internal/version.Version`，源码里不再有手改的常量（那个常量曾经是「发版忘了改一行 → 二进制自称旧版本 → 更新提示要么不弹要么装完还一直弹」的来源）。脚本会校验它是 `X.Y.Z` 形式：客户端按 semver 比大小，带 `v` 前缀或 `-rc` 后缀的解析不了，会被当成「读不懂，那就不提示」静默掉。目标平台列表是脚本里的 `TARGETS` 数组，新增一个架构只需要加一行 `"GOOS GOARCH s3目录名"`；目录名沿用 `mfmc` 的老命名（`darwin`=macOS arm64，`amd`=macOS x86_64，`linux`=Linux x86_64，`linux-arm64`=Linux arm64——历史遗留，新增时跟着这个习惯就行）。上传完会逐个 `curl` 一遍 CDN 确认 HTTP 200，不会发布了却没验证能不能下载。
 
 `scripts/install.sh` 是 `curl | bash` 用户实际执行的那份脚本，改完之后要跑一次 `release.sh` 才会同步到 S3——它不会单独发布，只跟着这个脚本一起上传。
 
@@ -304,7 +289,7 @@ make release      VERSION=0.2.0   # ② jms 交叉编译三平台并上传 CDN
 ```text
 --server <主机名>    # JumpServer 地址；不填走配置文件（必须有一个）
 --jmsd-addr <URL>    # jmsd 地址；同上，正式部署要在配置文件里填
---identity <私钥路径>
+--identity <私钥路径>  # 只给服务器上的程序用，人用默认的本机钥匙
 --ssh-port 2222
 --theme k9s          # 配色主题：k9s（默认）/ light / mono
 --cache-ttl 12h      # 本地资产缓存有效期，0 关闭；按 r 总是强制刷新
@@ -313,6 +298,7 @@ make release      VERSION=0.2.0   # ② jms 交叉编译三平台并上传 CDN
 --log-file <路径>    # 覆盖配置文件里的 log_file
 -c "<类型> [名称]"   # 快捷进入，见下
 --account <用户名>   # 配合 -c "<类型> <名称>" 指定用哪个账号
+-- <命令>            # 配合 -c "<类型> <名称>"，在资产上执行这条命令，见「远程执行命令」
 ```
 
 ### 快捷进入（`-c`）
@@ -338,15 +324,90 @@ make release      VERSION=0.2.0   # ② jms 交叉编译三平台并上传 CDN
 
 `--account` 比对的是**用户名**（`root`、`ubuntu`），不是 JumpServer 里的账号别名。这里不设「默认第一个」：jmsd 返回的账号顺序不保证稳定，同一条命令今天用普通账号、明天用高权限账号，是审计里最不该出现的事。
 
-需要 MFA 时会在终端上直接问验证码。**没有 `--totp` 参数**——验证码只有 30 秒有效期，写进命令行既进 shell history 又多半已经过期。
+没登录过或登录过期时，会打开浏览器登录 Google（终端里也会打印链接）。
 
 退出码（给脚本用）：
 
 | 码 | 含义 |
 |---|---|
 | 0 | 正常结束 |
-| 2 | 没出票，什么都没发生：参数错、名字没匹配上、账号不明确、本机没有 k9s、出票前取消了 MFA |
+| 2 | 没出票，什么都没发生：参数错、名字没匹配上、账号不明确、本机没有 k9s、出票前取消了登录 |
 | 3 | 出过票，可能已经留下一条 Core 会话记录：出票失败、连 Koko 失败、会话本身出错 |
+
+### 远程执行命令（`-c ... -- 命令`）
+
+`--` 后面的内容会在资产上执行，结果原样返回，和 `ssh host 命令` 一样。这个模式是给脚本和 AI 用的：
+
+```bash
+./jms -c "ec2 ng0" -- uptime
+./jms -c "ec2 10.0.0.13" -- uptime               # 名字或 IP 都行，都要完整写对
+./jms -c "ec2 ng0" --account deploy -- 'tail -n 100 /var/log/app.log | grep ERROR'
+./jms -c "ec2 ng0" -- 'cat > /tmp/x.conf' < x.conf   # stdin 也会转发过去
+```
+
+- **整条命令最好用一对引号括起来。** `--` 后面的几个参数会用空格拼成一条命令交给远端 shell 执行，所以 `grep "a b" f` 里的引号到远端就没了，这一点和 `ssh` 一样。
+- 不开终端（PTY），stdout 和 stderr 分开返回，可以直接接管道。
+- **兜底限制：默认 60 秒超时、输出（stdout + stderr 合计）最多 1MiB**，超过就断开，stderr 说明原因，退出码 255。`--timeout 5m` 放宽，`--timeout 0` 不限时；输出上限不可调。这只是防 AI 忘了加限制，断开后远端进程要等下次写输出才退出，所以 `tail -f`、大文件请在命令里自己带 `timeout 30`、`head -c`、`tail -n`。
+- **只支持 SSH 资产。** 数据库和 K8s 资产会在出票前直接报错。
+- **这个模式从不提问。** 登录过期时不会打开浏览器，而是直接失败，并提示让人去跑 `jms login`；资产有多个账号时也不会让你选，而是要求传 `--account`。原因是 AI 回答不了这些问题，而且在 Claude Code 里跑时，往终端上提问只会让它卡住。
+- 每条命令都会出一张票，Core 里会留一条「命令」类型的会话，记下命令原文和前 1KB 输出（这是 Koko 的行为）。jms 自己的日志不记命令原文，因为命令里可能带密码。
+- **命令被 JumpServer 命令过滤规则拒绝时，Koko 什么都不输出，退出码是 0**，看起来和成功一样。所以命令没有任何输出时，jms 会在 stderr 补一句提示。给 AI 用的账号应该靠目标机上的只读 Linux 账号来限制权限，不要靠命令过滤规则。
+
+退出码：
+
+| 码 | 含义 |
+|---|---|
+| 0 | 远端命令成功 |
+| 远端命令的退出码 | 原样透传，包括 1、2、127 等 |
+| 255 | jms 自己失败（参数错、登录过期、名字没匹配上、出票或连接失败），具体原因看 stderr。和 OpenSSH 一样 |
+
+### 查询 MySQL / PostgreSQL / Redis / MongoDB（`-c "rds 库名" -- SQL`、`-c "redis 名字" -- 命令`）
+
+对 MySQL 和 PostgreSQL 资产，`--` 后面是一条 SQL，由 jmsd 执行（Koko 不支持非交互地跑 SQL），结果按 `mysql -B` 的格式输出：首行列名、制表符分隔、`NULL` 原样、单元格里的制表符和换行转义成 `\t` `\n`。
+
+```bash
+./jms -c "rds staging-db" -- 'select id, status from orders.orders where id = 123'
+./jms -c "rds staging-db" -- 'show tables from orders'
+```
+
+- **只允许 `SELECT` `SHOW` `DESCRIBE` `EXPLAIN` `WITH`**，其余（包括 DDL）在连库前就拒绝；执行在只读事务里，结束后回滚。真正的保障还是授权给你的账号本身只读。
+- 最多 1000 行、1MiB、30 秒，超了截断并在 stderr 提示。
+- 没有 `use`：资产没配默认库时，MySQL 连上是 `mysql` 库，表名请写成 `库.表`；PostgreSQL 连的是资产配置的库（没配是 `postgres`），换库只能换资产。PostgreSQL 的 `\d` 这类 psql 命令不支持，查 `information_schema` 或 `pg_catalog`。
+- PostgreSQL 在资产开了 SSL 时用它配置的 `sslmode`；没开时先试 SSL、服务器不支持再明文（新版 RDS 默认强制 SSL）。只读事务和 30 秒 `statement_timeout` 在服务端生效，`set_config` 也改不回读写。
+- SQL 报错时 stderr 打印 `ERROR: ...`，退出码 1（和 mysql 客户端一样）；被拒绝或 jms 自己失败是 255。
+- 每条查询出一张票（Core 里有连接记录），SQL 原文、行数、耗时记进 jmsd 审计（`action=query`）。
+- 资产在 JumpServer 网域里时，jmsd 和 Koko 一样先 SSH 到该网域的网关再转发过去（不校验网关主机密钥，和 Koko 一致），审计里记 `gateway`。
+
+Redis 用 redis-cli 的写法，输出一行一个值（和 `redis-cli --raw` 一样），嵌套的列表（如 `SCAN` 的 key 列表）以 JSON 写在一行里：
+
+```bash
+./jms -c "redis cache-01" -- 'HGETALL user:123'
+./jms -c "redis cache-01" -- 'SCAN 0 MATCH user:* COUNT 100'
+./jms -c "redis cache-01" -- 'INFO memory'
+```
+
+- 只允许读命令：`GET` `MGET` `HGETALL` `HGET` `LRANGE` `SMEMBERS` `ZRANGE` `SCAN`/`HSCAN`/`SSCAN`/`ZSCAN` `TTL` `TYPE` `EXISTS` `INFO` `DBSIZE` `MEMORY USAGE` `SLOWLOG GET` 等。**`KEYS` 不允许**（会卡住整个实例），用 `SCAN`；`CONFIG GET` 不允许（会返回密码）。
+- 只连单个节点：集群模式的实例访问别的分片上的 key 会返回 `MOVED` 错误。
+
+MongoDB 资产也归在 `rds` 类型下。查询写成 MongoDB 的**命令文档（JSON）**，不是 mongosh 的 `db.x.find(...)`（那是 JavaScript）；`"$db"` 指定库，不写就用资产配置的库（没配是 `admin`）。输出一行一个文档（relaxed extended JSON），可以直接接 `jq`：
+
+```bash
+./jms -c "rds mongo-01" -- '{"listDatabases": 1, "nameOnly": true, "authorizedDatabases": true}'
+./jms -c "rds mongo-01" -- '{"find": "events", "filter": {"uid": 123}, "limit": 10, "$db": "app"}'
+./jms -c "rds mongo-01" -- '{"aggregate": "events", "pipeline": [{"$group": {"_id": "$type", "n": {"$sum": 1}}}], "cursor": {}, "$db": "app"}'
+./jms -c "rds mongo-01" -- '{"count": "events", "query": {"type": "click"}, "$db": "app"}'
+```
+
+- 只允许 `find` `aggregate` `count` `distinct` `listCollections` `listIndexes` `listDatabases` `dbStats` `collStats` `serverStatus` `ping` `buildInfo` `hello` `replSetGetStatus`；`aggregate` 里带 `$out` / `$merge` 的拒绝。
+- `find` / `aggregate` 最多 1000 个文档，超了截断并提示。
+
+### 登录（`jms login`）
+
+```bash
+./jms login              # 由人来跑，在浏览器里登录 Google
+```
+
+AI 跑命令遇到登录过期时，人跑一次 `jms login` 就行，之后在有效期内（jmsd 默认 10 天）AI 都能继续用。`-c` 用的是 TUI 那份本地资产缓存（默认 12 小时），在缓存里找不到名字或 IP 时会重新拉取一次再判断，所以新建的资产不用等缓存过期。
 
 ### 客户端配置与日志
 
@@ -357,7 +418,6 @@ server: "jumpserver.example.com"     # 必填
 # jmsd_addr: "https://jmsd.example.com"       # 正式部署必填，见下
 log_level: "info"        # info（默认）| debug
 # log_file: "/tmp/jms.log"
-# disable_update_check: true                  # 关掉启动时的更新提示
 # update_url: "https://.../jms"               # 换一个发布源，排练发布时用
 ```
 
@@ -376,9 +436,9 @@ go build -ldflags "\
 
 要连自己本机调试的 jmsd 就传 `--jmsd-addr http://localhost:8391`，或者在配置文件里写。前面挂了 TLS 就写 `https://`，jms 走标准 `net/http`，用系统信任库校验证书。
 
-日志级别只走配置文件，没有对应的命令行参数，`disable_update_check` 和 `update_url` 也一样。
+日志级别只走配置文件，没有对应的命令行参数，`update_url` 也一样。
 
-`disable_update_check: true` 之后启动时不会再有任何更新提示，也不会去连 CDN。`update_url` 换的是自动更新的发布源（默认就是上面 `install.sh` 那个 CDN 地址）——把某一台笔记本指到一个临时桶上，可以在不惊动其他人的前提下排练一次发布。**这两项写成「关掉」而不是「打开」是故意的**：没写这一项、或者干脆没有配置文件，检查都是开着的。
+`update_url` 换的是自动更新的发布源（默认就是上面 `install.sh` 那个 CDN 地址）——把某一台笔记本指到一个临时桶上，可以在不惊动其他人的前提下排练一次发布。
 
 `info` 只记错误和关键事件——登录、会话开始/结束。`debug` 额外记每个 jmsd 请求和 connect 每一步的耗时，「卡在哪一步」用它。
 
@@ -405,19 +465,15 @@ echo | openssl s_client -connect <你的 proxy_url 主机>:5002 2>/dev/null \
 
 配色主题：`k9s` 是默认，照着 K9s 自己的 stock skin 配的（dodgerblue 边框、orange 强调色、aqua 表头）；浅色终端用 `light`；`mono` 只用终端自身的颜色和粗体，适合自定义了配色方案或不支持真彩色的终端。三套主题的背景都不刷底色，沿用终端自己的背景。给一个不存在的名字会直接报错并列出可选值，不会静默回退。
 
-启动后没有登录页，也没有任何输入框：`jms` 本地读一下私钥、算出这把公钥的 SHA256 指纹，就直接问 jmsd「这个指纹是谁」（`GET /v1/whoami`），拿到用户名后直接进工作台去问 jmsd 要资源列表——全程不需要用户输入任何东西。只有 jmsd 判断你超过 `mfa_interval_days` 没验证过，才会弹 MFA 验证码框（见下），首次 `/v1/whoami` 也会走这条路径。真正跟 Koko 打交道，只发生在你选中一个资产按 Enter、jmsd 出票之后那一次。Server 和 identity 是 CLI 参数。
+启动后没有登录页，也没有任何输入框：`jms` 用本机钥匙签名问 jmsd「我是谁」（`GET /v1/whoami`），拿到用户名后直接进工作台去问 jmsd 要资源列表。这把钥匙没登录过 Google、或者超过 `mfa_interval_days` 了，jmsd 会要求登录，jms 弹一个「Google sign-in」框并打开浏览器，登录完自动继续。真正跟 Koko 打交道，只发生在你选中一个资产按 Enter、jmsd 出票之后那一次。Server 和 identity 是 CLI 参数。
 
-指纹反查是怎么做到的：JumpServer 把每个用户的 SSH 公钥加密存在 `authentication_sshkey` 表里，且用的是随机 nonce 的 AES-GCM——相同明文每次加密出来的密文都不一样，所以没法建索引直接查，只能全表拉下来逐把解密、算指纹比对。听着重，其实很轻：一家公司的活跃公钥数通常是几十到几百量级，全部解密+比对在个位数毫秒。如果同一把公钥被注册到了两个不同用户名下（JumpServer 对这个字段没有唯一约束，理论上能发生），jmsd 会拒绝反查而不是随便认一个，报「this SSH key is registered to more than one JumpServer user」。
+jmsd 认人只靠两份数据：Redis（或内存）里「这把钥匙绑给了谁」，和 Core 里启用用户的列表（`users_user` 的 `id/username/email`）。**用户列表在 jmsd 内存里缓存 30 秒**——认人必须在验签之前（不先知道是谁，就不知道该拿哪把公钥去验），不缓存的话任何能连上端口的人发一个签名乱填的请求，就能让 jmsd 查一次 Core 的生产库。代价是：**刚在 JumpServer 里禁用的人，最多 30 秒内还能用。** 想立刻生效就重启 jmsd。
 
-**这张表在 jmsd 内存里缓存 30 秒**，指纹也预先算好，所以上面那次扫描是每 30 秒一次、而不是每个请求一次。这不是为了省那几毫秒——**验签必须在反查之后**（不先知道是谁，就不知道该拿哪把公钥去验），所以在缓存之前，任何能连上端口的人只要发一个签名乱填的请求，就能让 jmsd 对 Core 的生产库跑一次全表查询加逐行解密：一个不要钱的请求换一次很贵的查询，打的还是 JumpServer 自己依赖的那个库。缓存之后伪造请求只值一次 map 查找，放大没了。
-
-代价是 30 秒的滞后，两个方向都有：**刚在网页上加的公钥，最多 30 秒后才认；刚停用的公钥，最多 30 秒内还能用。** 后者是真正要在意的那个方向，所以窗口取得比攻击者本来就要在里面活动的时间戳/nonce 窗口更小。想立刻生效就重启 jmsd。缓存刷新会在 `log_level: debug` 下打一行，带公钥条数和耗时——「jmsd 到底看到我新加的 key 了没」只有这一行能回答。
-
-签名协议也相应变了：以前每个请求把用户名和时间戳、随机数一起签名（`username|ts|nonce`），现在把用户名换成了公钥指纹（`fingerprint|ts|nonce`）——指纹不是秘密，它就是公钥的哈希，`ssh-keygen -lf` 谁都能算，跟明文用户名一样可以放心放在 URL 里传。
+签名内容是 `fingerprint|ts|nonce`——指纹不是秘密，它就是公钥的哈希，可以放心放在 URL 里传。
 
 ## jmsd（控制服务）
 
-`jmsd` 是 `jms` 用来做 MFA 间隔控制和资产查询的控制面服务（完整设计见 `docs/PLAN.md`）。它持有一个专用的 JumpServer 账号凭据，普通用户全程看不到、也不需要自己创建任何凭据。
+`jmsd` 是 `jms` 用来做登录（Google 绑钥匙）和资产查询的控制面服务（完整设计见 `docs/PLAN.md`）。它持有一个专用的 JumpServer 账号凭据，普通用户全程看不到、也不需要自己创建任何凭据。
 
 ```bash
 go build -o jmsd ./cmd/jmsd
@@ -462,7 +518,7 @@ export JMSADMIN_ACCESS_KEY_SECRET="<你自己的管理员 Access Key secret>"
 
 ### 2. 运行 jmsd
 
-配置走一个 YAML 文件（默认 `/etc/jmsd/config.yaml`，可用 `--config` 或 `JMSD_CONFIG` 换路径）。除了上一步拿到的 Access Key，jmsd 还要**直连 JumpServer Core 的 PostgreSQL**（只读账号即可）+ Core 的 Django `SECRET_KEY`，用来验证用户的 SSH 公钥和 TOTP 验证码——原因和加密方案细节见 `docs/PLAN.md` §4/§5.C/§5.D/§7.2。这个文件本身含密钥明文，权限**必须** `chmod 600`，且不要提交进版本库：
+配置走一个 YAML 文件（默认 `/etc/jmsd/config.yaml`，可用 `--config` 或 `JMSD_CONFIG` 换路径）。除了上一步拿到的 Access Key，jmsd 还要**直连 JumpServer Core 的 PostgreSQL**（只读账号即可），用来读启用用户列表、收藏和最近连接。这个文件本身含密钥明文，权限**必须** `chmod 600`，且不要提交进版本库：
 
 ```yaml
 # /etc/jmsd/config.yaml
@@ -472,13 +528,19 @@ access_key_id: "<access_key.id>"
 access_key_secret: "<access_key.secret>"
 core_db_dsn: "postgres://readonly_user:pass@core-db-host:5432/jumpserver?sslmode=disable"
 inventory_db_dsn: "jmsd_readonly:pass@tcp(mysql-host:3306)/cloud_meta?parseTime=true&loc=UTC"  # 可选，见下方「云元数据（d 键）」
-secret_key: "<JumpServer Core 自己 config.txt 里的 SECRET_KEY，原样抄>"
-mfa_interval_days: 10   # 可选，默认 10
+mfa_interval_days: 10   # 可选，默认 10：Google 登录一次管几天
+google:                 # 必填，见下方「用 Google 登录」
+  client_id: "xxxx.apps.googleusercontent.com"
+  hosted_domain: "example.com"
+service_keys:           # 可选，给机器用的钥匙，见下方「给机器用的钥匙」
+  - user: "sre-triage-agent"
+    public_key: "ssh-ed25519 AAAA... sre-triage"
 log_level: "info"       # 可选，info（默认）| debug；debug 会记每次库查询和 Core API 调用的耗时
 k8s:                     # K8s 连接必填；K9s 始终运行在用户电脑
   proxy_url: "https://jumpserver.example.com:5002"  # 办公网能访问到的 Koko :5002 地址
   insecure_skip_verify: false                 # 见下：先确认证书情况再决定要不要开
-redis:                   # 可选，见下方「MFA 状态存哪」
+audit_es: "http://es.example.com:9200"   # 可选，见下方「审计」
+redis:                   # 可选，见下方「登录状态存哪」
   addr: "127.0.0.1:6379"
   db: 0
 ```
@@ -487,19 +549,61 @@ redis:                   # 可选，见下方「MFA 状态存哪」
 ./jmsd --config /etc/jmsd/config.yaml
 ```
 
-#### MFA 状态存哪
+#### 给机器用的钥匙（`service_keys`）
 
-jmsd 记着每个人上次通过 MFA 的时间，用来判 `mfa_interval_days`。**不配 `redis:` 就存在进程内存里，jmsd 一重启记录清零，所有人都要重验一次。** 配上 `redis:` 之后这条记录（以及 30 秒的防重放 nonce）落到 Redis，重启不再影响：
+服务器上跑的程序（比如 sre-triage 线上环境里的 AI）开不了浏览器。给它生成一把钥匙，把公钥（`.pub` 文件那一行）和它代表的 JumpServer 用户名写进 `service_keys`，jms 用 `-i` 指定对应私钥：
+
+- 永久有效，不用登录 Google；HTTP 接口和隧道都认。
+- 它能连哪些机器、用哪个账号，完全由那个 JumpServer 用户的授权决定。建议单独建一个用户，只授权只读账号。
+- 那个用户在 JumpServer 里被禁用，这把钥匙同样失效。
+- 公钥解析不了或缺 `user`，jmsd 启动时直接报错。
+
+#### 用 Google 登录（`google`）
+
+人都靠 Google 登录，不需要准备 SSH 私钥、不往 JumpServer 登记公钥：
+
+1. jms 第一次运行时在本机自动生成一把钥匙（`~/Library/Application Support/jms/device_key`，Linux 是 `~/.config/jms/device_key`，权限 0600），用户不用管。
+2. 打开浏览器登录 Google（终端里也会打印链接，浏览器没自动打开就手动访问）。jmsd 按 Google 邮箱找到同 email 的 JumpServer 用户，把这把钥匙绑给他。
+3. 之后照常用，`mfa_interval_days` 天后再登录一次。每台电脑各自一把钥匙、各自登录。
+
+- `client_id` 是 GCP 里**桌面应用**类型的 OAuth 客户端，必须和编进 jms 的是同一个（构建时由 Makefile 的 `JMS_GOOGLE_CLIENT_ID` / `JMS_GOOGLE_CLIENT_SECRET` 注入；不注入编出来的 jms 登录不了）。
+- 只认 `hosted_domain` 这个 Workspace 的账号（看的是 Google 的 `hd` 字段，私人账号不算），邮箱必须已验证，且 JumpServer 里恰好一个启用的用户用这个 email。
+- 授权不变：能看到哪些资产、用哪个账号，全按那个 JumpServer 用户的授权来。用户在 JumpServer 里被禁用，绑定的钥匙 30 秒内失效。
+- 绑定存在 `redis` 里；没配 redis 就在内存，jmsd 重启后大家要重新登录一次。
+- jmsd 要能访问 `https://www.googleapis.com`，用来拉 Google 的签名公钥。
+- 发版顺序照旧：jmsd 先配好 `google` 再发 jms。
+
+#### 审计（`audit_es`）
+
+配上之后，jmsd 把每个动作写一条文档到 Elasticsearch：每天一个索引 `jmsd-audit-YYYY-MM-DD`（北京时间），保留 30 天。索引模板 `jmsd-audit` 和 ILM 策略 `jmsd-audit-30d` 由 jmsd 启动时自己建，不用手工维护。
+
+| `action` | 什么时候 | 主要字段 |
+|---|---|---|
+| `ticket` | 出票（SSH、k8s 等） | `asset` `account` `protocol` `ticket`；`-- 命令` 模式另带 `command`（jms 申报的命令原文，签名防篡改，但票不绑定命令，以 Core 里 Koko 的命令记录为准） |
+| `query` | 执行一条 SQL | `asset` `asset_name` `account` `ticket` `sql` `rows` `ms` |
+| `signin` | Google 登录，成功或被拒 | `email` `fingerprint` |
+| `tunnel.open` / `tunnel.close` | 隧道连上 / 断开 | `fingerprint`；close 带 `ms` `streams` |
+| `tunnel.stream` | 隧道里的一条流，或被拒的一条 | `requested` `target` `bytes_up` `bytes_down` `ms` |
+
+每条都有 `@timestamp` `action` `status`（`ok` / `denied` / `error`）`user` `remote` `host`，失败时带 `reason`。用 `ticket` 可以和 Core 里的连接记录对上。**不记查询结果和密码。**
+
+写入是后台每 5 秒批量一次，ES 慢或挂不影响请求；写失败或积压太多时，那批事件整段打到 jmsd 的日志里。没写出去的事件在 jmsd 进程退出时会丢。
+
+#### 登录状态存哪
+
+jmsd 记着每把钥匙绑给了谁。**不配 `redis:` 就存在进程内存里，jmsd 一重启全部清零，所有人都要重新登录一次 Google。** 配上 `redis:` 之后这些绑定（以及 30 秒的防重放 nonce）落到 Redis，重启不再影响：
 
 ```
 127.0.0.1:6379> KEYS jmsd:*
-1) "jmsd:mfa:zhangsan"        # 值是 unix 时间戳，TTL = mfa_interval_days
+1) "jmsd:key:SHA256:Xk3..."   # 值是 {"user_id","public_key"}，TTL = mfa_interval_days
 2) "jmsd:nonce:k3Jd8Fq2..."   # 防重放，30 秒后自动消失
 ```
 
-**Redis 必须 `bind 127.0.0.1`。** 这里不支持密码和 TLS，假定的就是一个本地无认证 Redis。存进去的都不是秘密——用户名、时间戳、随机数，TOTP 密钥和连接票一概不碰——但反过来是真风险：**能连上这个 Redis 的进程可以自己写一个 `jmsd:mfa:<用户名>`，等于替那个人跳过 MFA**。
+要踢掉某台电脑，`DEL` 它那条 `jmsd:key:` 就行。
 
-配了 `redis:` 但启动时连不上，jmsd **直接启动失败**，不会静默退回内存——否则「怎么又要我验 MFA」就成了一个没人查得出来的谜。运行中 Redis 挂掉，请求返回 503，而不是伪装成认证失败。
+**Redis 必须 `bind 127.0.0.1`。** 这里不支持密码和 TLS，假定的就是一个本地无认证 Redis。存进去的都不是秘密——用户 ID、公钥、随机数，连接票一概不碰——但反过来是真风险：**能连上这个 Redis 的进程可以自己写一条 `jmsd:key:<指纹>`，把任意钥匙绑给任意人**。
+
+配了 `redis:` 但启动时连不上，jmsd **直接启动失败**，不会静默退回内存——否则「怎么又要我登录」就成了一个没人查得出来的谜。运行中 Redis 挂掉，请求返回 503，而不是伪装成认证失败。
 
 **这个数据库账号除了 `SELECT`，只需要在 `assets_favoriteasset` 一张表上额外给 `INSERT`/`DELETE`**——那是「收藏」唯一要写的地方，jmsd 不写库里任何其他内容：
 
@@ -509,8 +613,6 @@ GRANT INSERT, DELETE ON assets_favoriteasset TO jmsd_readonly;
 ```
 
 收藏为什么走数据库而不是 REST API：`/api/v1/assets/favorite-assets/` 是按**调用方**身份返回的，也就是 jmsd 自己那个服务账号的收藏，加 `user_id`/`user` 过滤参数无效（v4.10.16 实测），拿不到「某个用户收藏了什么」。`assets_favoriteasset` 表可以，而且读的就是网页控制台那份数据，两边天然同步。`◷ Recent` 同理读 `terminal_session`，顺带免掉给 jmsd 的角色加 `terminal.view_session` 权限。
-
-`secret_key` 是 JumpServer 全库加密字段的主密钥，不止 jmsd 读的这两个字段；把它和只读账号搭配、文件权限锁死，是本方案能收窄这个风险的全部手段。
 
 #### 云元数据（`d` 键）
 
@@ -530,7 +632,7 @@ GRANT SELECT ON cloud_meta.cloud_instance_info TO 'jmsd_readonly'@'%';
 
 **describe 不再按调用者权限校验那个 key**，这是有意的取舍：校验就意味着每按一次 `d` 问一次 Core，正好是这个接口存在的意义所在。还成立的部分：签名保证调用者是个已知的 JumpServer 用户，而 key 只随着该用户有权限的资产发下去，所以拿到别的机器的 key 得靠别的途径。里面装的是规格、标签和网络 id，不是任何凭据。
 
-数据库挂掉时**继续用内存里那份**（和 SSH 指纹索引那份缓存的规矩相反：那份是拿来鉴权的，宁可失败也不能用旧的；这份只是给人看的，为一次抖动把面板弄没更亏）。启动时就连不上也只是元数据为空，`/v1/assets` 照常返回——资产列表是整个工作区，不能被一个只用来显示的库拖下水。
+数据库挂掉时**继续用内存里那份**（和用户列表那份缓存的规矩相反：那份是拿来鉴权的，宁可失败也不能用旧的；这份只是给人看的，为一次抖动把面板弄没更亏）。启动时就连不上也只是元数据为空，`/v1/assets` 照常返回——资产列表是整个工作区，不能被一个只用来显示的库拖下水。
 
 ### 已实现的接口
 
@@ -547,11 +649,11 @@ GET  /v1/assets/detail ?fp=&ts=&nonce=&sig=&asset=<id>                 -> {accou
 GET  /v1/assets/describe ?fp=&ts=&nonce=&sig=&key=<cloud_key>          -> 一台机器的云元数据，纯内存 map 查找
 GET  /v1/marks         ?fp=&ts=&nonce=&sig=                            -> {favorites: [id], recent: [id]}
 POST /v1/favorites     {fp, ts, nonce, sig, asset, starred}            -> {"status":"ok"}
-POST /v1/auth/mfa      {fp, ts, nonce, sig, code}                      -> {"status":"ok"}
+POST /v1/auth/google   {fp, ts, nonce, sig, public_key, id_token}      -> {"status":"ok", "username"}
 POST /v1/connections   {fp, ts, nonce, sig, asset, account, protocol} -> 连接票据
 ```
 
-`fp` 是调用方 SSH 公钥的 SHA256 指纹（`ssh.FingerprintSHA256`），不是用户名——jmsd 先按指纹反查出这是哪个用户（`userDirectory.Lookup`，查的是那份 30 秒缓存的指纹索引，见上一节），再验签。`sig` 是用户本地 SSH 私钥签名后 base64 的结果——`/v1/auth/mfa` 把 `code`、`/v1/connections` 把 `asset|account|protocol` 一并绑进签名内容，防止拿别的请求的签名跨接口重放。`jms` 内部的 `internal/jmsdclient` 自动处理签名。反查出用户后，jmsd 再拿这个用户在 JumpServer 里登记的**所有生效 SSH 公钥**逐把验签，只要有一把过就放行。所有接口（`/v1/auth/mfa` 自己除外——那正是用来重新验的）都会在 MFA 超过 `mfa_interval_days` 时返回 401 `{"mfa_required":true}`，`jms` 会自动弹验证码输入框——包括 `/v1/whoami` 本身，首次调用就可能要求先验一次 MFA。
+`fp` 是调用方钥匙的 SHA256 指纹（`ssh.FingerprintSHA256`），不是用户名——jmsd 先按指纹找到这把钥匙绑给了谁（`service_keys` 或 Google 登录留下的绑定，用户还得在启用列表里），再用那把公钥验签。`sig` 是本机钥匙签名后 base64 的结果——`/v1/auth/google` 把 `public_key|id_token`、`/v1/connections` 把 `asset|account|protocol` 一并绑进签名内容，防止拿别的请求的签名跨接口重放。`jms` 内部的 `internal/jmsdclient` 自动处理签名。钥匙没绑定或绑定过期，所有接口（`/v1/auth/google` 自己除外——那正是用来绑的）都返回 401 `{"mfa_required":true}`，`jms` 会自动打开 Google 登录——包括 `/v1/whoami` 本身，第一次运行就会先登录一次。
 
 选中资产按 Enter：`jms` 先调 `/v1/assets/detail` 拿该资产的可用账号/协议，账号只有一个就直接用、多个弹出选择框；协议里只要有 `ssh` 就默认用 `ssh`（不弹框，即使同时还挂着 `sftp` 等其他协议），没有 `ssh` 时才在多个协议之间弹框选择；再调 `/v1/connections` 拿一张连接票据，用 `JMS-<票号>`/`<票值>` 直接连 Koko 进入会话——跟阶段 0 手工验过的 `JMS-<票号>` 那条路完全一样，只是自动化了。
 
@@ -593,34 +695,23 @@ curl -x socks5h://127.0.0.1:9090 https://internal.example.com
 
 **发版顺序还是 jmsd 先**：老 jmsd 没有 `/v1/tunnel-config`，新 jms 的 `-w` 会明确报「这台 jmsd 比隧道功能老，需要先升级」而不是 `404 page not found`——但能看到那句话的前提是那一版 jmsd 已经上了。
 
-**为什么走 SSH、而不是复用控制面的 HTTP 端口**：认证由协议本身完成——客户端在握手里证明持有私钥，没有时间戳窗口要对、没有 nonce 要记，防重放是密钥交换的事；而它证明的身份就是控制面用的那一个：公钥指纹去查 JumpServer 里登记的 key（`userDirectory`）。顺带解决三件事：一条连接多路复用（浏览器开三十个流只握手一次）、不受前置 TLS 代理缓冲影响（HTTP hijack 会被 nginx/ALB 卡成半双工）、数据面端口能单独做防火墙策略。
+**为什么走 SSH、而不是复用控制面的 HTTP 端口**：认证由协议本身完成——客户端在握手里证明持有私钥，没有时间戳窗口要对、没有 nonce 要记，防重放是密钥交换的事；而它证明的身份就是控制面用的那一个：同一把本机钥匙、同一份绑定。顺带解决三件事：一条连接多路复用（浏览器开三十个流只握手一次）、不受前置 TLS 代理缓冲影响（HTTP hijack 会被 nginx/ALB 卡成半双工）、数据面端口能单独做防火墙策略。
 
-**MFA 和吊销的体验和别处一致**，靠的是把提示留在控制面：
+**登录和吊销的体验和别处一致**，靠的是把提示留在控制面：
 
-- `-w` 启动先发一次签名的 `/v1/tunnel-config`，那一跳穿的是和其他接口同一个 `authorize()`，MFA 过期就在这里弹验证码——同样的文案、同样的重试、同样的 429 锁定提示。**验过了才去拨 SSH**，所以 SSH 那边的 MFA 检查合法客户端永远不会触发；它只挡「拿到私钥直接拨数据面」的人，而那个人看到的是一句笼统的 `unable to authenticate`，什么都问不出来
-- 状态同源：两条路读的是同一份 MFA 记录，所以在 TUI 里验过一次，隧道跟着续期；反过来也一样
-- 隧道开着的时候 MFA 到期、或者公钥在 JumpServer 里被停用：新流会被拒，reason 是 `mfa_required` 的那种可恢复——客户端在终端里问一次验证码、重连、把刚才那条流补上；不可恢复的（key 被吊销、目标不在 allow 里）直接打印原因，不会在提示框里打转。这个区分在 `internal/tunnel/tunnel.go` 的 `classify`，四条出口都有测试
-- 认证只在握手那一次，所以长命连接必须另外收：每 30s 复查一遍公钥还在不在索引里、MFA 还新鲜不新鲜，不过关就**关掉整条连接**（不是只拒新流——穿过隧道的那条数据库连接否则会活过吊销）。吊销窗口 = 30s + `keyIndexTTL` 的 30s，和 HTTP 路径本来就接受的是同一个窗口
+- `-w` 启动先发一次签名的 `/v1/tunnel-config`，那一跳穿的是和其他接口同一个 `authorize()`，钥匙没登录就在这里打开 Google 登录。**登录过了才去拨 SSH**，所以 SSH 那边的检查合法客户端永远不会触发；它只挡「拿到钥匙直接拨数据面」的人，而那个人看到的是一句笼统的 `unable to authenticate`，什么都问不出来
+- 状态同源：两条路读的是同一份绑定，所以在 TUI 里登录过一次，隧道跟着可用；反过来也一样
+- 隧道开着的时候绑定到期：新流会被拒，reason 是 `mfa_required` 的那种可恢复——客户端重新登录 Google、重连、把刚才那条流补上；不可恢复的（用户被禁用、目标不在 allow 里）直接打印原因，不会打转。这个区分在 `internal/tunnel/tunnel.go` 的 `classify`，四条出口都有测试
+- 认证只在握手那一次，所以长命连接必须另外收：每 30s 复查一遍钥匙还绑没绑、用户还启没启用，不过关就**关掉整条连接**（不是只拒新流——穿过隧道的那条数据库连接否则会活过吊销）。吊销窗口 = 30s + 用户列表缓存（`userListTTL`）的 30s，和 HTTP 路径本来就接受的是同一个窗口。Redis 抖一下不算吊销，不会因此断掉隧道
 
-**授权是两道闸的交集**：`tunnel.allow` 必填（空列表拒绝启动），`require_permitted_asset` 再把目标收窄到调用者本来就有权限的资产地址。另外无论 allow 怎么写，`169.254.0.0/16`（云元数据，会吐出 `jmsd` 宿主机的 IAM 凭据）、`127.0.0.0/8` 和 `::1`（`jmsd` 自己的 localhost，那儿有它的 Redis，能写就能替任何人跳过 MFA）、`0.0.0.0` 和组播永远拒绝，`::ffff:127.0.0.1` 这种写法也算回环。域名在 `jmsd` 那端解析，**解析出的每一个地址都要过策略**，然后拨的是查过的那个 IP 而不是域名——先查名字再拨名字等于解析两次，第二次归攻击者控制。
+**授权是两道闸的交集**：`tunnel.allow` 可选，不写就是任意目标都放行，写了只放行列出的；`require_permitted_asset` 再把目标收窄到调用者本来就有权限的资产地址。另外无论 allow 怎么写，`169.254.0.0/16`（云元数据，会吐出 `jmsd` 宿主机的 IAM 凭据）、`127.0.0.0/8` 和 `::1`（`jmsd` 自己的 localhost，那儿有它的 Redis，能写就能把任意钥匙绑给任意人）、`0.0.0.0` 和组播永远拒绝，`::ffff:127.0.0.1` 这种写法也算回环。域名在 `jmsd` 那端解析，**解析出的每一个地址都要过策略**，然后拨的是查过的那个 IP 而不是域名——先查名字再拨名字等于解析两次，第二次归攻击者控制。
 
 **Core 里没有任何记录。** 没有票据、没有会话、没有命令审计——隧道的意义就是用你自己的凭据连过去，所以 `jmsd` 的日志（每条流一行：用户、请求的名字、真正拨的地址、上下行字节数、时长）是唯一能回答「谁通过隧道连了什么」的地方。这一点和 `jms` 的其他功能都不一样，开之前要接受它。
 
-### MFA 验证码有次数限制
-
-**同一个用户连续输错 5 次验证码，`/v1/auth/mfa` 会在之后 15 分钟内一律返回 429**，错误文案带剩余时间（`too many incorrect MFA codes; try again in 14m52s`），`jms` 会把它显示在验证码输入框下面。输对一次就清零——数的是**连续**失败，偶尔手滑不会跨天累积。锁定生效的那一刻会在 stderr 打一行 `jmsd: mfa lockout: <用户名> reached 5 consecutive incorrect codes`。
-
-为什么必须有：验证码 6 位、且校验接受 3 个时间窗，单次猜中概率约 3/10⁶。不限次数的话这不叫防护——拿到某人 SSH 私钥的人可以无限次发合法签名的请求，一秒 100 次的话期望一个多小时就猜进去了。而 MFA 存在的意义恰恰就是「私钥已经泄露」这个场景。限成 5 次/15 分钟之后同样的穷举要几百年。
-
-按**用户**限，不按来源 IP：能走到这一步的人已经持有能签成这个用户的私钥，账号是唯一他改不掉的标识，而 IP 在反向代理后面会退化成所有人共用一个。计数存在 jmsd 进程内存里，重启清零——这一条不像 MFA 时间戳那样需要持久化，因为忘掉锁定只对「能重启 jmsd 的人」有利，而那种人早就有别的路子了。
-
-「这个用户没登记 MFA 设备」不计入失败次数：那不是在猜，锁了只会盖住真正的原因。
-
 ## 当前限制
 
-- **只支持 macOS / Linux，Windows 编译不过**：`internal/sshclient/gateway.go` 用 `SIGWINCH` 同步终端窗口大小，这个信号 Windows 没有。Windows 用户请用 WSL2（原生 Linux 二进制，零移植风险），或者 SSH 到一台跑着 `jms` 的 Linux 机器上用——后者要注意每人必须是独立的系统账号，否则 `LoadIdentity` 会把 `~/.ssh` 里第一个私钥当成所有人的身份
-- 还不支持加密的私钥；请提供一个权限设置合理的未加密私钥。不过带口令的 key **不会再挡住后面的候选**：`~/.ssh/id_rsa` 带口令、`~/.ssh/id_ed25519` 没带的话，直接用后者（之前会在第一把上硬失败、报「encrypted private keys are not supported」，压根不去试第二把）。两把都用不了时，报的是那把存在但用不了的 key 的错，而不是笼统的「no private key found」——要改的就是那个文件
-- jmsd 不配 `redis:` 时，MFA 状态存在进程内存里，重启后所有用户都要重新验一次；配上就不会了，见上面「MFA 状态存哪」
+- **只支持 macOS / Linux，Windows 编译不过**：`internal/sshclient/gateway.go` 用 `SIGWINCH` 同步终端窗口大小，这个信号 Windows 没有。Windows 用户请用 WSL2（原生 Linux 二进制，零移植风险），或者 SSH 到一台跑着 `jms` 的 Linux 机器上用——后者要注意每人必须是独立的系统账号，否则大家共用同一把本机钥匙、也就是同一个身份
+- jmsd 不配 `redis:` 时，登录状态存在进程内存里，重启后所有用户都要重新登录一次 Google；配上就不会了，见上面「登录状态存哪」
 - 不支持"连接时手动输入账号密码"（`@INPUT` 别名的账号）——`jmsd` 直接把这类账号从选项里过滤掉，见 `docs/PLAN.md` §5.F.30
 - 不支持 Chen（Web GUI 资产）的数据库查询执行
 - 隧道（`jms -w`）在 Core 里**不留任何记录**：没有票据、没有会话、没有命令审计，`jmsd` 自己的日志是唯一的记录。默认关闭，见下面「隧道」
@@ -629,11 +720,11 @@ curl -x socks5h://127.0.0.1:9090 https://internal.example.com
 
 ## 安全
 
-`jmsd` 持有 JumpServer Core 的 Access Key、只读库账号和 Core 的 `SECRET_KEY`，部署时请确认：
+`jmsd` 持有 JumpServer Core 的 Access Key 和只读库账号，部署时请确认：
 
 - `jmsd` 的配置文件 `chmod 600`，且不在版本库里（本仓库的 `.gitignore` 已覆盖 `config-jmsd.yaml` / `jmsd.yaml`）
 - 数据库账号只给 `SELECT`，外加 `assets_favoriteasset` 一张表的 `INSERT`/`DELETE`
-- Redis（如启用）必须 `bind 127.0.0.1`——能写它的进程可以替任何人跳过 MFA
+- Redis（如启用）必须 `bind 127.0.0.1`——能写它的进程可以把任意钥匙绑给任意人
 - `jmsd` 只讲明文 HTTP，出内网前必须挂 TLS 代理
 - 隧道（如启用）的 `tunnel.host_key` 是私钥，`chmod 600`；`tunnel.allow` 要当成防火墙规则来评审，不是普通配置项
 

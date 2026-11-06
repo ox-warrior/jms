@@ -113,7 +113,7 @@ func (u *UI) connectResource(selection ResourceSelection, username string, jc *j
 		}
 	}
 
-	ticket, err := connectflow.MintTicket(gate, asset.ID, asset.Name, account.Alias, protocol.Name)
+	ticket, err := connectflow.MintTicket(gate, asset.ID, asset.Name, account.Alias, protocol.Name, "")
 	if err != nil {
 		reportFailed(tview.Escape(err.Error()))
 		return

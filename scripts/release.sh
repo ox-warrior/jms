@@ -5,6 +5,7 @@
 #   darwin  -> macOS arm64 (Apple Silicon)
 #   amd     -> macOS x86_64 (Intel)
 #   linux   -> Linux x86_64
+#   linux-arm64 -> Linux arm64 (aarch64)
 # 新增一个目标只需要在下面 TARGETS 里加一行 "GOOS GOARCH s3目录名"。
 #
 # 用法：
@@ -47,6 +48,7 @@ TARGETS=(
     "darwin arm64 darwin"
     "darwin amd64 amd"
     "linux  amd64 linux"
+    "linux  arm64 linux-arm64"
 )
 
 assume_yes=false
@@ -105,7 +107,9 @@ for t in "${TARGETS[@]}"; do
     mkdir -p "$(dirname "$out")"
     echo "编译 $goos/$goarch -> $out"
     GOOS="$goos" GOARCH="$goarch" CGO_ENABLED=0 go build \
-        -ldflags "-X github.com/leiyupeng/jumpserver-cli/internal/version.Version=$version" \
+        -ldflags "-X github.com/leiyupeng/jumpserver-cli/internal/version.Version=$version \
+                  -X github.com/leiyupeng/jumpserver-cli/internal/cli.googleClientID=${JMS_GOOGLE_CLIENT_ID:-} \
+                  -X github.com/leiyupeng/jumpserver-cli/internal/cli.googleClientSecret=${JMS_GOOGLE_CLIENT_SECRET:-}" \
         -o "$out" ./cmd/jms
     chmod a+x "$out"
 done

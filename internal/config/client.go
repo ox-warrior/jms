@@ -47,13 +47,6 @@ type ClientConfig struct {
 	// while rehearsing a release, so the rehearsal does not offer itself to
 	// everybody else.
 	UpdateURL string `yaml:"update_url"`
-	// DisableUpdateCheck turns the launch-time update offer off entirely.
-	//
-	// Spelled as the negative so that the zero value -- a config file that
-	// never mentions it, or no config file at all -- leaves the check on. A
-	// positive "update_check: true" would read the same in YAML and mean the
-	// opposite on every machine that had not been told about it.
-	DisableUpdateCheck bool `yaml:"disable_update_check"`
 	// LogFile is the path to jms's log file. Empty means the default
 	// location (~/Library/Caches/jms/jms.log on macOS, ~/.cache/jms/jms.log
 	// on Linux). Use "-" or "stdout" to write to stdout (not recommended

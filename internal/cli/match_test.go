@@ -97,3 +97,17 @@ func TestMatchAccountByUsernameAmbiguous(t *testing.T) {
 		t.Errorf("matchAccountByUsername() error = %v, want ErrAccountAmbiguous", err)
 	}
 }
+
+func TestMatchAssetByIP(t *testing.T) {
+	assets := []jmsd.AssetRow{
+		{ID: "1", Name: "web-10.0.0.13", Address: "10.0.0.13", Category: "host", Type: "linux"},
+		{ID: "2", Name: "other", Address: "10.0.0.14", Category: "host", Type: "linux"},
+	}
+	got, _, err := matchAsset(assets, jmsd.ResourceEC2, "10.0.0.13")
+	if err != nil || got.ID != "1" {
+		t.Fatalf("matchAsset by IP = %+v, %v; want asset 1", got, err)
+	}
+	if _, _, err := matchAsset(assets, jmsd.ResourceEC2, "10.0.0"); err == nil {
+		t.Fatal("a partial IP matched")
+	}
+}

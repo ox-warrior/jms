@@ -11,9 +11,9 @@ import (
 
 	"github.com/leiyupeng/jumpserver-cli/internal/assetcache"
 	"github.com/leiyupeng/jumpserver-cli/internal/config"
+	"github.com/leiyupeng/jumpserver-cli/internal/googlelogin"
 	"github.com/leiyupeng/jumpserver-cli/internal/jmsd"
 	"github.com/leiyupeng/jumpserver-cli/internal/jmslog"
-	"github.com/leiyupeng/jumpserver-cli/internal/selfupdate"
 	"github.com/leiyupeng/jumpserver-cli/internal/tui"
 	"github.com/leiyupeng/jumpserver-cli/internal/version"
 )
@@ -41,15 +41,33 @@ var defaultServer = ""
 // anything wider.
 var defaultJmsdAddr = ""
 
+// googleClientID and googleClientSecret are the Google OAuth "Desktop app"
+// client jms signs in with. Empty in the source tree and injected by the
+// Makefile, like the addresses above: a public repository cannot carry one
+// company's client. A build without them cannot sign in at all (see
+// errNoGoogleClient).
+var (
+	googleClientID     = ""
+	googleClientSecret = ""
+)
+
+// googleClient is the compiled-in client, or the zero value when there is
+// none.
+var errNoGoogleClient = errors.New("this jms was built without a Google client ID and cannot sign in -- build it with make")
+
+func googleClient() googlelogin.Client {
+	return googlelogin.Client{ID: googleClientID, Secret: googleClientSecret}
+}
+
 // requireAddresses rejects a run that has no JumpServer host or no jmsd base
 // URL. Both are empty in a stock build (see defaultServer), so the common first
 // run is a user who has not written a config file yet -- the message names the
 // exact file to create rather than only stating what is missing.
-// tunnelOnly is the "-w" run, which never dials Koko: demanding --server
-// there would refuse a mode that has no use for it.
-func requireAddresses(server, jmsdAddr, cfgPath string, tunnelOnly bool) error {
+// jmsdOnly is a run that never dials Koko -- "-w", "ls", "login": demanding
+// --server there would refuse a mode that has no use for it.
+func requireAddresses(server, jmsdAddr, cfgPath string, jmsdOnly bool) error {
 	var missing []string
-	if !tunnelOnly && strings.TrimSpace(server) == "" {
+	if !jmsdOnly && strings.TrimSpace(server) == "" {
 		missing = append(missing, "server (--server)")
 	}
 	if strings.TrimSpace(jmsdAddr) == "" {
@@ -83,10 +101,106 @@ type rootFlags struct {
 	// name-bearing command; rejected on its own so a typo'd or forgotten "-c"
 	// does not silently connect as the wrong default account.
 	account string
+	// remoteCommand is everything after "--", run on the asset instead of
+	// opening a shell. Not a flag: filled from the positional arguments.
+	remoteCommand string
+	// commandTimeout bounds remoteCommand; 0 disables it.
+	commandTimeout time.Duration
 }
 
 func Execute() error {
 	return newRootCommand().Execute()
+}
+
+// runEnv is what every jms mode resolves before it talks to anything: the
+// client config file and the two addresses it may supply.
+type runEnv struct {
+	cfg      config.ClientConfig
+	cfgPath  string
+	server   string
+	jmsdAddr string
+}
+
+// loadEnv reads the client config file and resolves both addresses.
+func loadEnv(cmd *cobra.Command, flags *rootFlags) runEnv {
+	env := runEnv{cfgPath: flags.configPath}
+	if env.cfgPath == "" {
+		if p, err := config.DefaultClientConfigPath(); err == nil {
+			env.cfgPath = p
+		}
+	}
+	// A missing file is silent (all defaults). Anything else -- a YAML typo,
+	// a bad mode -- is not: it also falls back to defaults, but silently doing
+	// so meant one stray character put every setting in the file back to its
+	// built-in value with nothing said. jms then ran against the wrong jmsd,
+	// which reads as jmsd being broken.
+	cfg, err := config.LoadClientConfig(env.cfgPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "jms: ignoring %s: %v\n", env.cfgPath, err)
+	}
+	env.cfg = cfg
+
+	// Addresses resolve flag > config file > built-in default. The flag is
+	// only allowed to win when it was actually typed: comparing against the
+	// default value cannot tell "not passed" from "passed the same value as
+	// the default", and Changed can. cmd.Flags() rather than
+	// PersistentFlags() so a subcommand sees the root's flags too.
+	env.server = flags.server
+	if !cmd.Flags().Changed("server") && cfg.Server != "" {
+		env.server = cfg.Server
+	}
+	env.jmsdAddr = flags.jmsdAddr
+	if !cmd.Flags().Changed("jmsd-addr") && cfg.JmsdAddr != "" {
+		env.jmsdAddr = cfg.JmsdAddr
+	}
+	return env
+}
+
+// open refuses a run missing an address it needs, then opens the log. The
+// returned func closes the log; it is safe to call when the log failed to
+// open.
+//
+// quiet drops the "logging to" line, for runs whose stderr is read by a
+// program -- an AI agent running a remote command sees that line on every
+// call, mixed into the command's own stderr.
+func (env runEnv) open(flags *rootFlags, needServer, quiet bool) (func(), error) {
+	// Checked here rather than at each use: ResolveServer rejects an empty
+	// host on the headless path, but the TUI path never calls it and would
+	// open a full-screen UI that fails on the first request with the
+	// terminal already taken. One guard covers both.
+	if err := requireAddresses(env.server, env.jmsdAddr, env.cfgPath, !needServer); err != nil {
+		return nil, resolveErr(err)
+	}
+
+	debug := env.cfg.LogLevel == "debug"
+	logFile := flags.logFile
+	if logFile == "" {
+		logFile = env.cfg.LogFile
+	}
+	// Opened here, before the TUI takes the screen, because this is the last
+	// moment a warning can reach the user's terminal. A failure is reported
+	// and then ignored: jms is still perfectly usable without a log, and
+	// refusing to start over an unwritable file would be worse than the
+	// problem.
+	path, err := jmslog.Open(logFile, debug)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "jms: logging disabled: %v\n", err)
+		return func() {}, nil
+	}
+	jmslog.Printf("---- jms %s starting (server=%s jmsd=%s debug=%t) ----",
+		version.Version, env.server, env.jmsdAddr, debug)
+	if !quiet {
+		fmt.Fprintf(os.Stderr, "jms: logging to %s\n", path)
+	}
+	return func() { _ = jmslog.Close() }, nil
+}
+
+// prepare is loadEnv and open together, for the subcommands, which have no
+// update check to start in between.
+func prepare(cmd *cobra.Command, flags *rootFlags, needServer bool) (runEnv, func(), error) {
+	env := loadEnv(cmd, flags)
+	closeLog, err := env.open(flags, needServer, true)
+	return env, closeLog, err
 }
 
 // validateTunnelFlags rejects a "-w" that cannot mean anything, alongside
@@ -121,16 +235,30 @@ func newRootCommand() *cobra.Command {
 		// ignored instead. Pinning it explicitly makes the guarantee stand on
 		// its own, and lets the message name the mistake that actually produces
 		// one: an unquoted shortcut, where `jms -c ec2 ng0` leaves "ng0" here.
+		//
+		// The one exception is everything after "--", which is a remote
+		// command (ArgsLenAtDash is 0 exactly when every argument came after
+		// it). Cobra also stops looking for subcommand names at "--", so
+		// `jms -c "ec2 x" -- login` runs login remotely rather than "jms login".
 		Args: func(cmd *cobra.Command, args []string) error {
-			if len(args) == 0 {
+			if len(args) == 0 || cmd.ArgsLenAtDash() == 0 {
 				return nil
 			}
 			return resolveErr(fmt.Errorf(
-				"unexpected argument %q for %q -- jms takes flags and the \"version\" subcommand only; "+
-					"a shortcut has to be one quoted value, as in: jms -c \"ec2 name\"",
+				"unexpected argument %q for %q -- a shortcut has to be one quoted value, as in: "+
+					"jms -c \"ec2 name\"; a remote command goes after \"--\", as in: jms -c \"ec2 name\" -- uptime",
 				args[0], cmd.CommandPath()))
 		},
-		RunE: func(cmd *cobra.Command, _ []string) error {
+		RunE: func(cmd *cobra.Command, args []string) (err error) {
+			// Everything after "--" is the remote command, joined the way ssh
+			// joins it: one string, interpreted by the remote shell.
+			flags.remoteCommand = strings.Join(args, " ")
+			// Deferred so it covers every exit below, flag errors included:
+			// once a remote command is given, any code but 255 is the
+			// command's own.
+			if flags.remoteCommand != "" {
+				defer func() { err = asCommandFailure(err) }()
+			}
 			// --account only means something alongside a name-bearing "-c" --
 			// checked before anything else runs so a typo'd or forgotten "-c"
 			// fails loudly instead of silently ignoring --account and falling
@@ -143,77 +271,21 @@ func newRootCommand() *cobra.Command {
 				return resolveErr(err)
 			}
 
-			// Load client config file (server, jmsd address, log settings). A
-			// missing file is not an error -- it just means all defaults.
-			cfgPath := flags.configPath
-			if cfgPath == "" {
-				if p, err := config.DefaultClientConfigPath(); err == nil {
-					cfgPath = p
-				}
-			}
-			// A missing file is silent (all defaults). Anything else -- a YAML
-			// typo, a bad mode -- is not: it also falls back to defaults, but
-			// silently doing so meant one stray character put every setting in
-			// the file back to its built-in value with nothing said. jms then
-			// ran against the wrong jmsd, which reads as jmsd being broken.
-			clientCfg, cfgErr := config.LoadClientConfig(cfgPath)
-			if cfgErr != nil {
-				fmt.Fprintf(os.Stderr, "jms: ignoring %s: %v\n", cfgPath, cfgErr)
-			}
-			// Started here, as early as the config that configures it allows,
-			// and joined just before the TUI opens. Everything between the two
-			// points -- opening the log, resolving addresses -- runs while the
-			// request is in flight, so a reachable CDN costs the launch nothing
-			// measurable and an unreachable one costs updateCheckBudget once.
-			//
-			// target.Name != "" is the headless "-c type name" run, which must
-			// never be interrupted by a question (see updatesWanted).
-			var updates <-chan *selfupdate.Release
-			if updatesWanted(flags.tunnelPort != 0 || (target != nil && target.Name != ""), clientCfg.DisableUpdateCheck) {
-				updates = startUpdateCheck(clientCfg.UpdateURL)
-			}
+			env := loadEnv(cmd, &flags)
+			// Started here and joined once the log is open, so the round trip
+			// overlaps that work; an unreachable CDN costs updateCheckBudget once.
+			updates := startUpdateCheck(env.cfg.UpdateURL)
 
-			debug := clientCfg.LogLevel == "debug"
-			logFile := flags.logFile
-			if logFile == "" {
-				logFile = clientCfg.LogFile
-			}
-
-			// Addresses resolve flag > config file > built-in default. The
-			// flag is only allowed to win when it was actually typed:
-			// comparing against the default value cannot tell "not passed"
-			// from "passed the same value as the default", and Changed can.
-			server := flags.server
-			if !cmd.PersistentFlags().Changed("server") && clientCfg.Server != "" {
-				server = clientCfg.Server
-			}
-			jmsdAddr := flags.jmsdAddr
-			if !cmd.PersistentFlags().Changed("jmsd-addr") && clientCfg.JmsdAddr != "" {
-				jmsdAddr = clientCfg.JmsdAddr
-			}
-
-			// Checked here rather than at each use: ResolveServer rejects an
-			// empty host on the headless path, but the TUI path never calls it
-			// and would open a full-screen UI that fails on the first request
-			// with the terminal already taken. One guard covers both.
-			if err := requireAddresses(server, jmsdAddr, cfgPath, flags.tunnelPort != 0); err != nil {
-				return resolveErr(err)
-			}
-
-			// Opened here, before the TUI takes the screen, because this is
-			// the last moment a warning can reach the user's terminal. A
-			// failure is reported and then ignored: jms is still perfectly
-			// usable without a log, and refusing to start over an unwritable
-			// file would be worse than the problem.
-			path, err := jmslog.Open(logFile, debug)
+			closeLog, err := env.open(&flags, flags.tunnelPort == 0, flags.remoteCommand != "")
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "jms: logging disabled: %v\n", err)
-			} else {
-				defer jmslog.Close()
-				jmslog.Printf("---- jms %s starting (server=%s jmsd=%s debug=%t) ----",
-					version.Version, server, jmsdAddr, debug)
-				fmt.Fprintf(os.Stderr, "jms: logging to %s\n", path)
+				return err
 			}
+			defer closeLog()
+			// Before every mode, scripted ones included: see update.go.
+			if release := <-updates; release != nil {
+				return resolveErr(forceUpdate(cmd.Context(), release))
+			}
+			server, jmsdAddr := env.server, env.jmsdAddr
 
 			// Placed after the log is open (and before any Koko address is
 			// resolved) so a tunnel's stream failures land in the same file as
@@ -233,9 +305,11 @@ func newRootCommand() *cobra.Command {
 				}
 				return runHeadless(cmd.Context(), headlessTarget{
 					Kind: target.Kind, Name: target.Name, Account: flags.account,
+					Command: flags.remoteCommand, Timeout: flags.commandTimeout,
 				}, headlessDeps{
 					Endpoints: endpoints, JmsdAddr: jmsdAddr,
 					Identity: flags.identity, K9sPath: strings.TrimSpace(flags.k9sPath),
+					CacheTTL: flags.cacheTTL,
 				})
 			}
 
@@ -243,6 +317,7 @@ func newRootCommand() *cobra.Command {
 				Server: server, SSHPort: flags.sshPort,
 				Identity: flags.identity, JmsdAddr: jmsdAddr, Theme: flags.theme,
 				CacheTTL: flags.cacheTTL, K9sPath: strings.TrimSpace(flags.k9sPath),
+				Google: googleClient(),
 			}
 			if target != nil {
 				// tui.ResourceKind is jmsd.ResourceKind (a type alias, see
@@ -250,14 +325,6 @@ func newRootCommand() *cobra.Command {
 				opts.InitialKind = target.Kind
 			}
 
-			// The last point at which the terminal is still the user's to
-			// prompt on -- tui.Run takes the screen on the next line. Accepting
-			// the update restarts the process from here and never comes back.
-			if updates != nil {
-				if release := <-updates; release != nil {
-					offerUpdate(cmd.Context(), release)
-				}
-			}
 			return tui.Run(opts)
 		},
 	}
@@ -288,7 +355,10 @@ func newRootCommand() *cobra.Command {
 	cmd.PersistentFlags().StringVar(&flags.account, "account", "",
 		"account username to connect as with -c \"type name\" (default: the asset's first permitted account)")
 
-	cmd.AddCommand(newVersionCommand())
+	cmd.PersistentFlags().DurationVar(&flags.commandTimeout, "timeout", 60*time.Second,
+		"with -c \"type name\" -- command: give up after this long (0 = never); output is also capped at 1MiB")
+
+	cmd.AddCommand(newVersionCommand(), newLoginCommand(&flags))
 	return cmd
 }
 
@@ -310,6 +380,32 @@ func defaultConfigPath() string {
 		return "~/.config/jms/config.yaml"
 	}
 	return path
+}
+
+// newLoginCommand is how a human refreshes MFA on behalf of the runs that
+// will not prompt: "ls" and "-c ... -- CMD", usually driven by an AI agent.
+// It is just the sign-in those runs do, allowed to ask. When MFA is still
+// fresh nothing is asked, and jmsd does not report when it will lapse, so
+// "still valid" is all there is to say.
+func newLoginCommand(flags *rootFlags) *cobra.Command {
+	return &cobra.Command{
+		Use:   "login",
+		Short: "Sign in with Google now, so commands that never prompt (-c ... -- CMD) keep working",
+		Args:  cobra.NoArgs,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			env, closeLog, err := prepare(cmd, flags, false)
+			if err != nil {
+				return err
+			}
+			defer closeLog()
+			_, identity, err := signIn(cmd.Context(), flags.identity, env.jmsdAddr, true)
+			if err != nil {
+				return err
+			}
+			fmt.Fprintf(os.Stderr, "jms: signed in as %s\n", identity.Username)
+			return nil
+		},
+	}
 }
 
 func newVersionCommand() *cobra.Command {

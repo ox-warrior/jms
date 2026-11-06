@@ -22,8 +22,8 @@ const nonceWindow = 30 * time.Second
 // attack that never happened.
 var errStateUnavailable = errors.New("auth state store unavailable")
 
-// StateStore holds jmsd's auth state: which nonces have been used, and when
-// each user last completed MFA. Two implementations: memStateStore below,
+// StateStore holds jmsd's auth state: which nonces have been used, and which
+// keys a Google sign-in has bound to whom. Two implementations: memStateStore below,
 // which loses everything on restart, and redisStateStore, which doesn't.
 //
 // Every method returns an error because the Redis implementation can fail at
@@ -37,28 +37,43 @@ type StateStore interface {
 	// Check-and-record is atomic: two concurrent replays of the same captured
 	// request must not both pass.
 	SeenNonce(nonce string) (bool, error)
-	// LastMFA returns the last time username completed MFA, if ever.
-	LastMFA(username string) (time.Time, bool, error)
-	// RecordMFA sets username's last-MFA timestamp.
-	RecordMFA(username string, at time.Time) error
+	// BindKey records that the key fingerprinted fp belongs to b.UserID until
+	// until. Written by a Google sign-in; this is how a key nobody registered
+	// in JumpServer becomes an identity.
+	BindKey(fp string, b keyBinding, until time.Time) error
+	// BoundKey returns fp's binding if it has not expired.
+	BoundKey(fp string) (keyBinding, bool, error)
 	// Close releases whatever the implementation holds open.
 	Close() error
 }
 
+// keyBinding is what a Google sign-in leaves behind: whose key this is, and
+// the key itself, since without a JumpServer registration there is nowhere
+// else to find it to verify a signature.
+type keyBinding struct {
+	UserID    string `json:"user_id"`
+	PublicKey string `json:"public_key"`
+}
+
+type boundKey struct {
+	keyBinding
+	until time.Time
+}
+
 // memStateStore is a mutex-guarded in-memory StateStore, used when no Redis
-// is configured. State is lost on restart: last_mfa_at resets to "never", so
-// every user re-verifies MFA once after jmsd restarts. Configure Redis (see
+// is configured. State is lost on restart: every binding goes, so every user
+// signs in to Google once more after jmsd restarts. Configure Redis (see
 // RedisConfig) to avoid that.
 type memStateStore struct {
-	mu      sync.Mutex
-	nonces  map[string]time.Time // nonce -> when it was recorded
-	lastMFA map[string]time.Time // username -> last successful MFA
+	mu     sync.Mutex
+	nonces map[string]time.Time // nonce -> when it was recorded
+	keys   map[string]boundKey  // fingerprint -> owner, until expiry
 }
 
 func newMemStateStore() *memStateStore {
 	return &memStateStore{
-		nonces:  make(map[string]time.Time),
-		lastMFA: make(map[string]time.Time),
+		nonces: make(map[string]time.Time),
+		keys:   make(map[string]boundKey),
 	}
 }
 
@@ -89,18 +104,23 @@ func (s *memStateStore) sweepNoncesLocked(now time.Time) {
 	}
 }
 
-func (s *memStateStore) LastMFA(username string) (time.Time, bool, error) {
+// ponytail: expired bindings are never swept; one entry per laptop per sign-in
+// is small, and a restart clears them all anyway.
+func (s *memStateStore) BindKey(fp string, b keyBinding, until time.Time) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	t, ok := s.lastMFA[username]
-	return t, ok, nil
+	s.keys[fp] = boundKey{b, until}
+	return nil
 }
 
-func (s *memStateStore) RecordMFA(username string, at time.Time) error {
+func (s *memStateStore) BoundKey(fp string) (keyBinding, bool, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	s.lastMFA[username] = at
-	return nil
+	k, ok := s.keys[fp]
+	if !ok || !time.Now().Before(k.until) {
+		return keyBinding{}, false, nil
+	}
+	return k.keyBinding, true, nil
 }
 
 func (s *memStateStore) Close() error { return nil }

@@ -22,7 +22,10 @@
 
 MODULE  := github.com/leiyupeng/jumpserver-cli
 VERSION ?= dev
-LDFLAGS := -X $(MODULE)/internal/version.Version=$(VERSION)
+# = 而不是 :=，因为 Google 那两个变量定义在下面。
+LDFLAGS  = -X $(MODULE)/internal/version.Version=$(VERSION) \
+           -X $(MODULE)/internal/cli.googleClientID=$(JMS_GOOGLE_CLIENT_ID) \
+           -X $(MODULE)/internal/cli.googleClientSecret=$(JMS_GOOGLE_CLIENT_SECRET)
 
 # 机房那台的架构。CGO_ENABLED=0 让它静态链接，扔到任何 glibc 版本的机器上都能
 # 跑，不必对着目标机的 libc 试。
@@ -43,6 +46,13 @@ JMS_CDN_BASE  ?= https://dist.example.com/jms
 JMS_SERVER    ?= jumpserver.example.com
 JMS_JMSD_ADDR ?= http://jmsd.example.com:8391
 export JMS_S3_BUCKET JMS_CDN_BASE JMS_SERVER JMS_JMSD_ADDR
+
+# Google 登录用的 OAuth 客户端（GCP 里「桌面应用」类型），编进 jms，必填：
+# 留空编出来的 jms 登录不了。桌面应用的 secret 按 Google 的定义不算机密，但跟上面的地址
+# 一样只放在这份本地 Makefile 里，不进公开仓库。jmsd 那边的 google.client_id 要填同一个 ID。
+JMS_GOOGLE_CLIENT_ID     ?= 
+JMS_GOOGLE_CLIENT_SECRET ?= 
+export JMS_GOOGLE_CLIENT_ID JMS_GOOGLE_CLIENT_SECRET
 
 .DEFAULT_GOAL := help
 .PHONY: help build jms jmsd jmsd-admin jmsd-release release release-dry test test-race check fmt vet clean

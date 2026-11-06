@@ -160,6 +160,93 @@ func RunInteractiveShell(client *ssh.Client) error {
 	return sessionOutcome(waitErr, stdin.n.Load(), head.text())
 }
 
+// RunCommand runs command on the asset behind client the way `ssh host cmd`
+// does: no PTY, stdio wired straight through, and the remote exit status
+// returned as a value rather than an error. Koko relays the asset's own exit
+// status (koko pkg/handler/server_ssh.go, proxyAssetCommand), so status is the
+// command's, not Koko's.
+//
+// No PTY is load-bearing, not a style choice: Koko only takes its exec path
+// for a session that asked for a command without a PTY, and a PTY would also
+// fold stderr into stdout, which a caller parsing the output cannot undo.
+//
+// silent reports that nothing at all came back on either stream. Koko answers
+// a command its command-filter ACL rejects by closing the session with nothing
+// printed and status 0, which from here is indistinguishable from a command
+// that legitimately prints nothing -- so the caller gets the fact and decides
+// how to word the doubt.
+//
+// timeout (0 = none) and maxOutput cap a run that an AI forgot to bound: past
+// either, the session is closed and the error says which. Closing stops Koko
+// relaying within one SSH window; the remote process itself only notices on
+// its next write, so a bound inside the command (timeout, head) is still the
+// one that stops it at the source.
+func RunCommand(client *ssh.Client, command string, timeout time.Duration, maxOutput int64) (status int, silent bool, err error) {
+	session, err := client.NewSession()
+	if err != nil {
+		return 0, false, err
+	}
+	defer session.Close()
+
+	var written atomic.Int64
+	var truncated, timedOut atomic.Bool
+	limit := func() {
+		truncated.Store(true)
+		_ = session.Close()
+	}
+	session.Stdin = os.Stdin
+	session.Stdout = &countWriter{w: os.Stdout, n: &written, max: maxOutput, over: limit}
+	session.Stderr = &countWriter{w: os.Stderr, n: &written, max: maxOutput, over: limit}
+	if timeout > 0 {
+		timer := time.AfterFunc(timeout, func() {
+			timedOut.Store(true)
+			_ = session.Close()
+		})
+		defer timer.Stop()
+	}
+
+	err = session.Run(command)
+	switch {
+	case truncated.Load():
+		return 0, false, fmt.Errorf("output truncated at %d bytes; bound the command (head, tail -n) to see it all", maxOutput)
+	case timedOut.Load():
+		return 0, false, fmt.Errorf("timed out after %s; bound the command (timeout N) or raise --timeout", timeout)
+	}
+	var exitErr *ssh.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitStatus(), written.Load() == 0, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return 0, written.Load() == 0, nil
+}
+
+// countWriter counts bytes written through it and, past max, writes only up
+// to max and calls over. The counter is shared and atomic because stdout and
+// stderr are each copied on their own x/crypto/ssh goroutine, and the cap is
+// on the two together.
+type countWriter struct {
+	w    io.Writer
+	n    *atomic.Int64
+	max  int64
+	over func()
+}
+
+func (c *countWriter) Write(p []byte) (int, error) {
+	total := c.n.Add(int64(len(p)))
+	if c.max > 0 && total > c.max {
+		if keep := int64(len(p)) - (total - c.max); keep > 0 {
+			_, _ = c.w.Write(p[:keep])
+		}
+		c.over()
+		return 0, errOutputLimit
+	}
+	return c.w.Write(p)
+}
+
+var errOutputLimit = errors.New("output limit reached")
+
 // sessionOutcome decides what a finished session is reported as. Split out of
 // RunInteractiveShell only so it can be tested without a live Koko.
 //

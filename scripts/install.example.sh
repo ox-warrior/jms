@@ -22,6 +22,20 @@ jms_jmsd_addr="${JMS_JMSD_ADDR:-}"
 base_path='/usr/local/bin'
 jms_path="$base_path/jms"
 
+# 装给谁。`curl … | sudo bash` 时脚本是 root，但 jms 是给敲命令的那个人用的：
+# 二进制和配置都要归他，否则配置他读不了，强制更新也换不掉二进制。
+run_user="${SUDO_USER:-$(id -un)}"
+user_home=$(eval echo "~$run_user")
+# 真正的二进制放在用户自己的目录里，/usr/local/bin/jms 只是指过去的软链接：
+# jms 自更新时会解析软链接，替换的是这一份，不需要 sudo。
+real_dir="$user_home/.jms/bin"
+real_path="$real_dir/jms"
+give_to_user() {
+    if [ "$(id -u)" = 0 ] && [ "$run_user" != root ]; then
+        chown -R "$run_user" "$@"
+    fi
+}
+
 platform=$(uname -s | tr '[:upper:]' '[:lower:]')
 machine_arch=$(uname -m)
 
@@ -34,12 +48,14 @@ case "$platform" in
         fi
         ;;
     linux)
-        if [[ "$machine_arch" == "x86_64" ]]; then
-            target_dir="linux"
-        else
-            echo "jms 目前只提供 Linux amd64 (x86_64) 版本，$machine_arch 暂未发布。" >&2
-            exit 1
-        fi
+        case "$machine_arch" in
+            x86_64) target_dir="linux" ;;
+            aarch64|arm64) target_dir="linux-arm64" ;;
+            *)
+                echo "jms 目前只提供 Linux amd64 / arm64 版本，$machine_arch 暂未发布。" >&2
+                exit 1
+                ;;
+        esac
         ;;
     *)
         echo "jms 目前只提供 macOS / Linux 版本，$platform 暂未发布。" >&2
@@ -82,7 +98,14 @@ fi
 # 别人能执行但读不了，而 /usr/local/bin 里的东西是给这台机器上所有人用的。
 chmod 0755 "$tmp_path"
 
-# 需要 sudo 就明说，而不是让 mv 吐一行 Permission denied 了事。
+mkdir -p "$real_dir" && mv -f "$tmp_path" "$real_path" || {
+    echo "写入 $real_path 失败，未安装。" >&2
+    exit 1
+}
+give_to_user "$user_home/.jms"
+
+# 需要 sudo 就明说，而不是让 ln 吐一行 Permission denied 了事。只有建软链接
+# 这一步可能要 sudo，而且只在第一次装、或者从老的装法迁过来时。
 sudo_cmd=""
 if [ ! -w "$base_path" ]; then
     if [ ! -d "$base_path" ]; then
@@ -91,20 +114,24 @@ if [ ! -w "$base_path" ]; then
         echo "$base_path 需要管理员权限，下面会向你要密码。"
         sudo_cmd="sudo"
     else
-        echo "$base_path 不可写，且这台机器上没有 sudo。未安装。" >&2
+        echo "$base_path 不可写，且这台机器上没有 sudo。jms 已装到 $real_path，请把 $real_dir 加进 PATH。" >&2
         exit 1
     fi
 fi
-
-$sudo_cmd mkdir -p "$base_path" || { echo "创建 $base_path 失败，未安装。" >&2; exit 1; }
-$sudo_cmd mv -f "$tmp_path" "$jms_path" || { echo "写入 $jms_path 失败，未安装。" >&2; exit 1; }
+if [ "$(readlink "$jms_path" 2>/dev/null)" != "$real_path" ]; then
+    $sudo_cmd mkdir -p "$base_path" &&
+        $sudo_cmd ln -sfn "$real_path" "$jms_path" || {
+        echo "在 $jms_path 建软链接失败。jms 已装到 $real_path，请把 $real_dir 加进 PATH。" >&2
+        exit 1
+    }
+fi
 trap - EXIT
 
 # 这个文件只有老版本的 install.sh 还在读，留着是为了不让装了旧脚本的人看到
 # 一个空文件；jms 自己判断要不要更新读的是 manifest.json。
-curl -fsS "$cdn_base/version" -o ~/.jms_version 2>/dev/null || true
+curl -fsS "$cdn_base/version" -o "$user_home/.jms_version" 2>/dev/null && give_to_user "$user_home/.jms_version" || true
 
-installed=$("$jms_path" version 2>/dev/null | head -1)
+installed=$("$real_path" version 2>/dev/null | head -1)
 echo "安装完成${installed:+：$installed}。"
 
 # 写配置。
@@ -122,8 +149,8 @@ echo "安装完成${installed:+：$installed}。"
 #
 # 用户自己加的其他项（log_level、cache_ttl、k9s_path…）逐行保留：那些是偏好，
 # 不是部署事实，没有理由被一次安装重置。
-config_dir="$HOME/Library/Application Support/jms"
-[ "$platform" = "linux" ] && config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/jms"
+config_dir="$user_home/Library/Application Support/jms"
+[ "$platform" = "linux" ] && config_dir="${XDG_CONFIG_HOME:-$user_home/.config}/jms"
 config_path="$config_dir/config.yaml"
 
 if [ -z "$jms_server" ] || [ -z "$jms_jmsd_addr" ]; then
@@ -155,6 +182,7 @@ else
 
     if mv -f "$tmp_config" "$config_path"; then
         chmod 0600 "$config_path"
+        give_to_user "$config_dir"
         echo "配置已写入：$config_path"
     else
         rm -f "$tmp_config"
