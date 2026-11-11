@@ -7,11 +7,13 @@ import (
 
 // jmsdPermissionCodenames are the permissions the jmsd account is granted,
 // verified against the JumpServer v4.10.16 source (see docs/PLAN.md §7.1).
-// Deliberately excludes authentication.view_superconnectiontokensecret --
-// that's what lets a caller read a target asset's password, and jmsd never
-// needs it.
+// view_superconnectiontokensecret lets jmsd read a target account's secret
+// from a ticket it minted. Only DB queries need it (jmsd runs the SQL itself,
+// since Koko has no non-interactive SQL); without it every query fails at
+// GetConnectTokenInfo with 403, and SSH / k8s keep working.
 //
-// The first two are what jmsd uses at runtime; view_user is not. jmsd stopped
+// view_userassets, add_superconnectiontoken and the secret are what jmsd uses
+// at runtime; view_user is not. jmsd stopped
 // needing it once the user id came out of signature verification instead of a
 // lookup by username (docs/PLAN.md §5.22). It is kept because jmsd-admin's own
 // findUserID needs it and this list is what the role ends up holding -- a role
@@ -20,6 +22,7 @@ import (
 var jmsdPermissionCodenames = []string{
 	"view_userassets",
 	"add_superconnectiontoken",
+	"view_superconnectiontokensecret",
 	"view_user",
 }
 

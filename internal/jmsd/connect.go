@@ -165,8 +165,8 @@ func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
 	info, err := s.core.CreateSuperConnectToken(
 		buildTokenRequest(user, req.Asset, req.Account, req.Protocol, r.RemoteAddr))
 	mintDone()
-	ev := auditEvent{Action: auditTicket, Status: "ok", User: user.Username, Remote: remoteIP(r.RemoteAddr),
-		Asset: req.Asset, Account: req.Account, Protocol: req.Protocol, Ticket: info.ID, Command: req.Command}
+	ev := auditEvent{Action: auditTicket, Status: "ok", User: user.Username, OnBehalfOf: user.OnBehalfOf,
+		Remote: remoteIP(r.RemoteAddr), Asset: req.Asset, Account: req.Account, Protocol: req.Protocol, Ticket: info.ID, Command: req.Command}
 	if err != nil {
 		ev.Status, ev.Reason = "error", err.Error()
 		s.audit.send(ev)

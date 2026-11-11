@@ -10,6 +10,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -340,6 +341,8 @@ type signedFields struct {
 	Ts          string `json:"ts"`
 	Nonce       string `json:"nonce"`
 	Sig         string `json:"sig"`
+	// OnBehalfOf: see userRecord.OnBehalfOf. Optional, service keys only.
+	OnBehalfOf string `json:"on_behalf_of,omitempty"`
 }
 
 func (f signedFields) complete() bool {
@@ -362,6 +365,11 @@ func (f signedFields) signature() signedFields { return f }
 // captured from a read cannot be replayed to mint a token or star an asset of
 // the attacker's choosing.
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request, f signedFields, extra ...string) *userRecord {
+	if f.OnBehalfOf != "" {
+		// Signed in last, matching jmsdclient: unsigned, anyone could relabel
+		// a captured request as someone else's.
+		extra = append(slices.Clip(extra), OnBehalfPrefix+f.OnBehalfOf)
+	}
 	user, err := s.verifySignedRequest(f.Fingerprint, f.Ts, f.Nonce, f.Sig, extra...)
 	if errors.Is(err, errUnknownKey) {
 		// jms's key before its first Google sign-in, or after the binding
@@ -374,6 +382,19 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, f signedField
 	if err != nil {
 		fail(w, r, "", authFailureStatus(err), err.Error())
 		return nil
+	}
+	if f.OnBehalfOf != "" {
+		// A person's own key acts for that person; letting it name someone
+		// else would let anyone put another name in the audit.
+		if !user.Service {
+			fail(w, r, user.Username, http.StatusForbidden, "on_behalf_of is only accepted from a service key")
+			return nil
+		}
+		if len(f.OnBehalfOf) > 254 {
+			fail(w, r, user.Username, http.StatusBadRequest, "on_behalf_of is too long")
+			return nil
+		}
+		user.OnBehalfOf = f.OnBehalfOf
 	}
 	// Recorded as soon as the signature checks out, so every line logging
 	// prints for an authenticated request names the caller.
@@ -415,6 +436,7 @@ func (s *Server) requireSignature(next authedHandler) http.HandlerFunc {
 		q := r.URL.Query()
 		fields := signedFields{
 			Fingerprint: q.Get("fp"), Ts: q.Get("ts"), Nonce: q.Get("nonce"), Sig: q.Get("sig"),
+			OnBehalfOf: q.Get("on_behalf_of"),
 		}
 		if !fields.complete() {
 			fail(w, r, "", http.StatusBadRequest, "fp, ts, nonce, sig are required")
@@ -539,6 +561,7 @@ func (s *Server) identify(fingerprint string) (*userRecord, error) {
 			return nil, err
 		}
 		user.PublicKeys = []string{k.PublicKey}
+		user.Service = true
 		return user, nil
 	}
 	b, ok, err := s.state.BoundKey(fingerprint)

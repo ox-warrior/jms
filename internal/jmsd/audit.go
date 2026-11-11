@@ -46,10 +46,13 @@ type auditEvent struct {
 	Action    string    `json:"action"`
 	Status    string    `json:"status"` // ok | denied | error
 	User      string    `json:"user,omitempty"`
-	Remote    string    `json:"remote,omitempty"` // the caller's address
-	Ms        int64     `json:"ms,omitempty"`
-	Reason    string    `json:"reason,omitempty"` // why it was denied or failed
-	Host      string    `json:"host,omitempty"`   // which jmsd
+	// OnBehalfOf: the person a service key acted for, as the key's holder
+	// (e.g. the sre-triage gateway) vouched. User is still whose grants applied.
+	OnBehalfOf string `json:"on_behalf_of,omitempty"`
+	Remote     string `json:"remote,omitempty"` // the caller's address
+	Ms         int64  `json:"ms,omitempty"`
+	Reason     string `json:"reason,omitempty"` // why it was denied or failed
+	Host       string `json:"host,omitempty"`   // which jmsd
 
 	// What it was aimed at.
 	Asset     string `json:"asset,omitempty"`      // asset id
@@ -89,7 +92,7 @@ var (
 	// at write time instead of quietly becoming a new column nobody queries.
 	auditMapping = map[string]any{"dynamic": "strict", "properties": map[string]any{
 		"@timestamp": map[string]any{"type": "date"},
-		"action":     kw, "status": kw, "user": kw, "remote": kw, "ms": long,
+		"action":     kw, "status": kw, "user": kw, "on_behalf_of": kw, "remote": kw, "ms": long,
 		"reason": map[string]any{"type": "text"},
 		"host":   kw, "asset": kw, "asset_name": kw, "account": kw, "protocol": kw, "ticket": kw, "gateway": kw,
 		"sql": textKeyword, "command": textKeyword,

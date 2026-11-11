@@ -19,6 +19,7 @@ coverage.out
 # jmsd.example.yaml (placeholders) belongs in the repo.
 /jmsd.yaml
 /config-jmsd.yaml
+/config-jmsd.*.yaml
 /config-jms.yaml
 
 # 上游源码，只为核对注释里的行号引用，浅克隆自 v4.10.16 tag

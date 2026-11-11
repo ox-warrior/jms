@@ -24,6 +24,7 @@ import (
 	"maps"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -65,6 +66,11 @@ type Client struct {
 	fingerprint string
 	signer      ssh.Signer
 	httpClient  *http.Client
+	// OnBehalfOf names the person a service key is acting for (the gateway
+	// that holds the key knows who asked; jmsd cannot). Signed into every
+	// request so it cannot be swapped in transit, and recorded in jmsd's
+	// audit. jmsd refuses it from anything but a service key.
+	OnBehalfOf string
 }
 
 // New returns a Client for signer (typically from sshclient.LoadIdentity --
@@ -250,6 +256,9 @@ func (c *Client) postSignedWithNonce(ctx context.Context, path, nonce string, ex
 		return err
 	}
 	body := map[string]any{"fp": c.fingerprint, "ts": ts, "nonce": nonce, "sig": sig}
+	if c.OnBehalfOf != "" {
+		body["on_behalf_of"] = c.OnBehalfOf
+	}
 	maps.Copy(body, fields)
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -280,6 +289,9 @@ func (c *Client) getSigned(ctx context.Context, path string, extraQuery url.Valu
 	q.Set("ts", ts)
 	q.Set("nonce", nonce)
 	q.Set("sig", sig)
+	if c.OnBehalfOf != "" {
+		q.Set("on_behalf_of", c.OnBehalfOf)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path+"?"+q.Encode(), nil)
 	if err != nil {
@@ -374,6 +386,11 @@ func (c *Client) sign(extra ...string) (ts, nonce, sig string, err error) {
 
 func (c *Client) signWith(nonce string, extra ...string) (ts, sig string, err error) {
 	ts = strconv.FormatInt(time.Now().Unix(), 10)
+	if c.OnBehalfOf != "" {
+		// Last, and only when set: requests without it sign exactly what
+		// they always did, so older jmsd and jms keep agreeing.
+		extra = append(slices.Clip(extra), jmsd.OnBehalfPrefix+c.OnBehalfOf)
+	}
 	payload := strings.Join(append([]string{c.fingerprint, ts, nonce}, extra...), "|")
 	signature, err := c.signer.Sign(rand.Reader, []byte(payload))
 	if err != nil {

@@ -27,6 +27,12 @@ type userRecord struct {
 	// that may sign for this caller (a bound key or a service key). Core's own
 	// authentication_sshkey table is not read.
 	PublicKeys []string
+	// Service marks a caller identified by a service key (config
+	// service_keys) rather than a Google-bound key; set by Server.identify.
+	Service bool
+	// OnBehalfOf is who a service key said it is acting for, already
+	// verified as signed (Server.authorize). Recorded, never authorised on.
+	OnBehalfOf string
 }
 
 // NewCoreDB opens a connection to Core's database. dsn is a lib/pq DSN, e.g.

@@ -55,8 +55,10 @@ type headlessDeps struct {
 	Endpoints config.Endpoints
 	JmsdAddr  string
 	Identity  string
-	K9sPath   string
-	CacheTTL  time.Duration
+	// OnBehalfOf: see jmsdclient.Client.OnBehalfOf.
+	OnBehalfOf string
+	K9sPath    string
+	CacheTTL   time.Duration
 }
 
 // errMFANeedsLogin is what a run that cannot prompt reports when MFA has
@@ -80,12 +82,13 @@ var errUnregisteredKey = errors.New("this -i key is not in jmsd's service_keys -
 // with errMFANeedsLogin. An agent such as Claude Code cannot click through a
 // browser, so a sign-in there would hang until the tool call times out rather
 // than fail.
-func signIn(ctx context.Context, identityPath, jmsdAddr string, interactive bool) (*connectflow.Gate, jmsdclient.Identity, error) {
+func signIn(ctx context.Context, identityPath, onBehalfOf, jmsdAddr string, interactive bool) (*connectflow.Gate, jmsdclient.Identity, error) {
 	signer, _, err := sshclient.LoadIdentity(identityPath)
 	if err != nil {
 		return nil, jmsdclient.Identity{}, resolveErr(err)
 	}
 	jc := jmsdclient.New(jmsdAddr, signer)
+	jc.OnBehalfOf = onBehalfOf
 	gate := newGate(ctx, jc, identityPath != "", interactive)
 
 	identity, err := connectflow.WithMFA(gate, func() (jmsdclient.Identity, error) { return jc.Whoami(ctx) })
@@ -132,7 +135,7 @@ func runHeadless(ctx context.Context, target headlessTarget, deps headlessDeps) 
 		return resolveErr(err)
 	}
 	runCommand := target.Command != ""
-	gate, identity, err := signIn(ctx, deps.Identity, deps.JmsdAddr, !runCommand)
+	gate, identity, err := signIn(ctx, deps.Identity, deps.OnBehalfOf, deps.JmsdAddr, !runCommand)
 	if err != nil {
 		return err
 	}

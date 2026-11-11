@@ -105,3 +105,9 @@ func ResourceKindTokens() []string {
 // (POST /v1/query): for these, jms's "-- command" is a query, not a shell
 // command. Shared so the two sides cannot disagree about which they are.
 var QueryProtocols = []string{"mysql", "postgresql", "redis", "mongodb"}
+
+// OnBehalfPrefix tags the on-behalf-of value in a signed request payload (see
+// jmsdclient.Client.OnBehalfOf), so it can never be read as one of an
+// endpoint's own trailing fields. Shared because both ends must build the
+// payload byte for byte alike.
+const OnBehalfPrefix = "on_behalf_of="

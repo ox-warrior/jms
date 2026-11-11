@@ -170,3 +170,70 @@ func TestBoundKeyFollowsItsOwner(t *testing.T) {
 		t.Fatal("bound key still works after its owner was disabled")
 	}
 }
+
+// on_behalf_of is how the sre-triage gateway, running jms for many people
+// under one service key, says who asked. It must be signed (or anyone could
+// relabel a captured request) and only a service key may use it (or a person
+// could put someone else's name in the audit).
+func TestOnBehalfOf(t *testing.T) {
+	newKey := func() ssh.Signer {
+		_, priv, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatal(err)
+		}
+		s, err := ssh.NewSignerFromKey(priv)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	service, device := newKey(), newKey()
+	srv := &Server{
+		cfg: Config{ServiceKeys: []ServiceKey{{
+			User: "sre-triage-agent", PublicKey: string(ssh.MarshalAuthorizedKey(service.PublicKey())),
+		}}},
+		users: newUserDirectory(func() ([]userRecord, error) {
+			return []userRecord{{ID: "u1", Username: "sre-triage-agent"}, {ID: "u2", Username: "alice"}}, nil
+		}, 0),
+		state: newMemStateStore(),
+	}
+	devFP := ssh.FingerprintSHA256(device.PublicKey())
+	if err := srv.state.BindKey(devFP, keyBinding{UserID: "u2",
+		PublicKey: string(ssh.MarshalAuthorizedKey(device.PublicKey()))}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+
+	n := 0
+	call := func(key ssh.Signer, obo string, signObo bool) (*userRecord, int) {
+		n++
+		fp := ssh.FingerprintSHA256(key.PublicKey())
+		ts, nonce := strconv.FormatInt(time.Now().Unix(), 10), fmt.Sprint("n", n)
+		payload := fp + "|" + ts + "|" + nonce
+		if signObo {
+			payload += "|" + OnBehalfPrefix + obo
+		}
+		sig, err := key.Sign(rand.Reader, []byte(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := httptest.NewRecorder()
+		user := srv.authorize(w, httptest.NewRequest(http.MethodGet, "/v1/whoami", nil), signedFields{
+			Fingerprint: fp, Ts: ts, Nonce: nonce, Sig: base64.StdEncoding.EncodeToString(ssh.Marshal(sig)),
+			OnBehalfOf: obo,
+		})
+		return user, w.Code
+	}
+
+	if u, _ := call(service, "bob@example.com", true); u == nil || u.OnBehalfOf != "bob@example.com" || u.Username != "sre-triage-agent" {
+		t.Fatalf("signed on_behalf_of from a service key: got %+v, want sre-triage-agent acting for bob", u)
+	}
+	if u, code := call(service, "bob@example.com", false); u != nil || code != http.StatusUnauthorized {
+		t.Fatalf("unsigned on_behalf_of: got %+v / %d, want refused with 401", u, code)
+	}
+	if u, code := call(device, "bob@example.com", true); u != nil || code != http.StatusForbidden {
+		t.Fatalf("on_behalf_of from a person's key: got %+v / %d, want refused with 403", u, code)
+	}
+	if u, _ := call(device, "", false); u == nil || u.Username != "alice" || u.OnBehalfOf != "" {
+		t.Fatalf("plain request from a person's key: got %+v, want alice", u)
+	}
+}

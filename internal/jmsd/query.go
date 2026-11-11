@@ -70,7 +70,7 @@ func (s *Server) handleQuery(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	started := time.Now()
-	ev := auditEvent{Timestamp: started, Action: auditQuery, Status: "ok", User: user.Username,
+	ev := auditEvent{Timestamp: started, Action: auditQuery, Status: "ok", User: user.Username, OnBehalfOf: user.OnBehalfOf,
 		Remote: remoteIP(r.RemoteAddr), Asset: req.Asset, Account: req.Account, Protocol: req.Protocol, SQL: req.SQL}
 	refuse := func(status int, msg string) {
 		ev.Status, ev.Reason, ev.Ms = "denied", msg, time.Since(started).Milliseconds()

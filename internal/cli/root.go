@@ -106,6 +106,9 @@ type rootFlags struct {
 	remoteCommand string
 	// commandTimeout bounds remoteCommand; 0 disables it.
 	commandTimeout time.Duration
+	// onBehalfOf is who a service key (-i) is acting for, recorded in jmsd's
+	// audit. For a gateway that runs jms for many people under one key.
+	onBehalfOf string
 }
 
 func Execute() error {
@@ -203,6 +206,20 @@ func prepare(cmd *cobra.Command, flags *rootFlags, needServer bool) (runEnv, fun
 	return env, closeLog, err
 }
 
+// validateOnBehalfOf: only a service key may speak for someone (jmsd refuses
+// it otherwise), and the tunnel's streams are audited without it.
+func validateOnBehalfOf(flags rootFlags) error {
+	switch {
+	case flags.onBehalfOf == "":
+		return nil
+	case flags.identity == "":
+		return errors.New("--on-behalf-of needs -i: only a service key can act for someone else")
+	case flags.tunnelPort != 0:
+		return errors.New("--on-behalf-of is not supported with -w")
+	}
+	return nil
+}
+
 // validateTunnelFlags rejects a "-w" that cannot mean anything, alongside
 // parseCommandFlags doing the same for "--account". Split out rather than
 // inlined in RunE because each of these is a mistake a user makes once and
@@ -266,6 +283,9 @@ func newRootCommand() *cobra.Command {
 			if err := validateTunnelFlags(flags); err != nil {
 				return resolveErr(err)
 			}
+			if err := validateOnBehalfOf(flags); err != nil {
+				return resolveErr(err)
+			}
 			target, err := parseCommandFlags(flags)
 			if err != nil {
 				return resolveErr(err)
@@ -308,7 +328,7 @@ func newRootCommand() *cobra.Command {
 					Command: flags.remoteCommand, Timeout: flags.commandTimeout,
 				}, headlessDeps{
 					Endpoints: endpoints, JmsdAddr: jmsdAddr,
-					Identity: flags.identity, K9sPath: strings.TrimSpace(flags.k9sPath),
+					Identity: flags.identity, OnBehalfOf: flags.onBehalfOf, K9sPath: strings.TrimSpace(flags.k9sPath),
 					CacheTTL: flags.cacheTTL,
 				})
 			}
@@ -335,6 +355,8 @@ func newRootCommand() *cobra.Command {
 		"JumpServer host to reach Koko on; the config file's server can set this")
 	cmd.PersistentFlags().IntVar(&flags.sshPort, "ssh-port", 2222, "Koko SSH port")
 	cmd.PersistentFlags().StringVarP(&flags.identity, "identity", "i", "", "private key path")
+	cmd.PersistentFlags().StringVar(&flags.onBehalfOf, "on-behalf-of", "",
+		"with -i: the person this service key is acting for, recorded in jmsd's audit")
 	cmd.PersistentFlags().StringVar(&flags.jmsdAddr, "jmsd-addr", defaultJmsdAddr,
 		"jmsd base URL; the config file's jmsd_addr can set this")
 	cmd.PersistentFlags().StringVar(&flags.theme, "theme", tui.DefaultTheme,
@@ -398,7 +420,7 @@ func newLoginCommand(flags *rootFlags) *cobra.Command {
 				return err
 			}
 			defer closeLog()
-			_, identity, err := signIn(cmd.Context(), flags.identity, env.jmsdAddr, true)
+			_, identity, err := signIn(cmd.Context(), flags.identity, flags.onBehalfOf, env.jmsdAddr, true)
 			if err != nil {
 				return err
 			}
