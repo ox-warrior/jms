@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/jumpserver-dev/sdk-go/model"
 	"github.com/jumpserver-dev/sdk-go/service"
@@ -97,6 +99,12 @@ func (s *Server) handleAssetDetail(w http.ResponseWriter, r *http.Request, user 
 		fail(w, r, user.Username, http.StatusBadRequest, "asset is required")
 		return
 	}
+	// Service keys only: a program runs command after command on one host,
+	// and a person in the TUI should see a just-granted account at once.
+	if out, ok := s.details.get(user, assetID); ok {
+		writeJSON(w, out)
+		return
+	}
 	detailDone := timed("core api: GetUserPermAssetDetailById asset=%s user=%s", assetID, user.ID)
 	detail, err := s.core.GetUserPermAssetDetailById(user.ID, assetID)
 	detailDone()
@@ -115,8 +123,64 @@ func (s *Server) handleAssetDetail(w http.ResponseWriter, r *http.Request, user 
 	if len(out.Accounts) == 0 || len(out.Protocols) == 0 {
 		note(r, "", fmt.Sprintf("asset=%s has %d permitted accounts and %d koko-capable protocols (of %d) -- client cannot connect",
 			assetID, len(out.Accounts), len(out.Protocols), len(detail.PermedProtocols)))
+	} else {
+		s.details.put(user, assetID, out)
 	}
 	writeJSON(w, out)
+}
+
+// detailTTL is how long a service key's asset detail is reused.
+const detailTTL = 5 * time.Minute
+
+// detailCache remembers which accounts and protocols a user may use on an
+// asset, for service-key callers only, so a run of commands against one host
+// asks Core once rather than once per command.
+//
+// It cannot outlive a revoked permission in any way that matters: the ticket
+// is still minted per command, and Core checks the permission again there.
+// A stale entry only means the refusal comes from that step instead.
+// Entries are overwritten, never swept: the map is bounded by users x assets.
+type detailCache struct {
+	mu      sync.Mutex
+	entries map[string]detailEntry
+	now     func() time.Time // nil means time.Now; tests set it
+}
+
+type detailEntry struct {
+	detail AssetDetail
+	at     time.Time
+}
+
+func (c *detailCache) clock() time.Time {
+	if c.now != nil {
+		return c.now()
+	}
+	return time.Now()
+}
+
+func (c *detailCache) get(user *userRecord, assetID string) (AssetDetail, bool) {
+	if !user.Service {
+		return AssetDetail{}, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	e, ok := c.entries[user.ID+"|"+assetID]
+	if !ok || c.clock().Sub(e.at) >= detailTTL {
+		return AssetDetail{}, false
+	}
+	return e.detail, true
+}
+
+func (c *detailCache) put(user *userRecord, assetID string, detail AssetDetail) {
+	if !user.Service {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.entries == nil {
+		c.entries = map[string]detailEntry{}
+	}
+	c.entries[user.ID+"|"+assetID] = detailEntry{detail: detail, at: c.clock()}
 }
 
 // connectionRequest is the body of POST /v1/connections.

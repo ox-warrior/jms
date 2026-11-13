@@ -23,6 +23,9 @@ google:
 # service_keys:
 #   - user: "sre-triage-agent"
 #     public_key: "ssh-ed25519 AAAA... sre-triage"
+#   # 不写 user：这把钥匙自己没有权限，每个请求必须带 --on-behalf-of <邮箱>，按那个人的授权办事。
+#   # 它能代表任何人，私钥按这个分量保管。
+#   - public_key: "ssh-ed25519 AAAA... gateway"
 
 # 可选。审计事件写到这个 Elasticsearch（出票、SQL 查询、Google 登录、隧道），
 # 每天一个索引 jmsd-audit-YYYY-MM-DD（北京时间），保留 30 天；索引模板和 ILM 策略 jmsd 启动时自己建。
