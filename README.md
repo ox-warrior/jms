@@ -265,6 +265,7 @@ redis:                                   # 强烈建议配，否则 jmsd 重启�
 service_keys:                            # 可选，给程序用的钥匙
   - user: "ai-agent"                     # 它代表的 JumpServer 用户名
     public_key: "ssh-ed25519 AAAA... ai-agent"
+  - public_key: "ssh-ed25519 AAAA... gateway"   # 不写 user：只能替别人操作（见下）
 
 audit_es: "http://es.example.com:9200"   # 可选，审计写到 Elasticsearch
 
@@ -289,7 +290,7 @@ log_level: "info"                        # info | debug
 
 - **`google`**：`client_id` 是 GCP 里「桌面应用」类型的 OAuth 客户端，必须和编进 jms 的是同一个。只接受 `hosted_domain` 这个 Workspace 下已验证的邮箱，且 JumpServer 里恰好有一个启用的用户用这个邮箱。jmsd 要能访问 `https://www.googleapis.com`（拉 Google 的签名公钥）。jmsd 不需要 client secret。
 - **`redis`**：存钥匙绑定和防重放的随机数。**必须 `bind 127.0.0.1`**，不支持密码：能写这个 Redis 的进程可以把任意钥匙绑给任意人。配了但启动时连不上，jmsd 直接启动失败。要踢掉某台电脑，`DEL jmsd:key:<指纹>`。
-- **`service_keys`**：公钥解析失败或缺 `user` 时 jmsd 启动失败。这把钥匙能连什么，完全由那个 JumpServer 用户的授权决定，建议单独建用户、只授权只读账号，并配上 JumpServer 的命令过滤。
+- **`service_keys`**：公钥解析失败时 jmsd 启动失败。**不写 `user` 的钥匙自己没有任何权限**，每个请求都必须带 `--on-behalf-of <邮箱>`，jmsd 按这个人的 JumpServer 授权办事（这个人能连什么它就能连什么，Core 里的会话也记在这个人名下），不带就拒绝；这种钥匙能代表任何人，私钥要按这个分量保管。写了 `user` 的钥匙照旧：这把钥匙能连什么，完全由那个 JumpServer 用户的授权决定，建议单独建用户、只授权只读账号，并配上 JumpServer 的命令过滤。
 - **`audit_es`**：每个动作写一条文档，每天一个索引 `jmsd-audit-YYYY-MM-DD`（北京时间），保留 30 天；索引模板和 ILM 策略由 jmsd 启动时自动创建。后台每 5 秒批量写一次，ES 故障不影响使用，写失败的事件会打到 jmsd 日志里。
 
   | `action` | 时机 | 主要字段 |

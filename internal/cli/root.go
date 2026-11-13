@@ -294,7 +294,7 @@ func newRootCommand() *cobra.Command {
 			env := loadEnv(cmd, &flags)
 			// Started here and joined once the log is open, so the round trip
 			// overlaps that work; an unreachable CDN costs updateCheckBudget once.
-			updates := startUpdateCheck(env.cfg.UpdateURL)
+			updates := updateCheckFor(flags.identity, env.cfg.UpdateURL)
 
 			closeLog, err := env.open(&flags, flags.tunnelPort == 0, flags.remoteCommand != "")
 			if err != nil {
@@ -302,8 +302,12 @@ func newRootCommand() *cobra.Command {
 			}
 			defer closeLog()
 			// Before every mode, scripted ones included: see update.go.
-			if release := <-updates; release != nil {
-				return resolveErr(forceUpdate(cmd.Context(), release))
+			// updates is nil under -i, and receiving from a nil channel blocks
+			// forever: the nil check is what keeps a service key from hanging.
+			if updates != nil {
+				if release := <-updates; release != nil {
+					return resolveErr(forceUpdate(cmd.Context(), release))
+				}
 			}
 			server, jmsdAddr := env.server, env.jmsdAddr
 

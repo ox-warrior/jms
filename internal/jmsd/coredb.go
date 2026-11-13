@@ -31,7 +31,9 @@ type userRecord struct {
 	// service_keys) rather than a Google-bound key; set by Server.identify.
 	Service bool
 	// OnBehalfOf is who a service key said it is acting for, already
-	// verified as signed (Server.authorize). Recorded, never authorised on.
+	// verified as signed (Server.authorize). For a key with a user of its own
+	// it is only recorded; for a key without one, this record IS that person
+	// (Server.authorize swapped it in) and the field says how they got here.
 	OnBehalfOf string
 }
 

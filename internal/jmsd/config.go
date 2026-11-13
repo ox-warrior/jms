@@ -100,6 +100,10 @@ type Config struct {
 
 // ServiceKey is one service_keys entry: a public key, authorized_keys form,
 // and the JumpServer username it acts as.
+//
+// User may be left empty: the key then has no permissions of its own and every
+// request must name the person it acts for (on_behalf_of), whose JumpServer
+// permissions apply.
 type ServiceKey struct {
 	User      string `yaml:"user"`
 	PublicKey string `yaml:"public_key"`
@@ -231,8 +235,8 @@ func LoadConfig(path string) (Config, error) {
 		return cfg, fmt.Errorf("%s: google.hosted_domain is required", path)
 	}
 	for _, k := range cfg.ServiceKeys {
-		if _, _, _, _, err := ssh.ParseAuthorizedKey([]byte(k.PublicKey)); err != nil || k.User == "" {
-			return cfg, fmt.Errorf("%s: service_keys: each entry needs user and public_key "+
+		if _, _, _, _, err := ssh.ParseAuthorizedKey([]byte(k.PublicKey)); err != nil {
+			return cfg, fmt.Errorf("%s: service_keys: each entry needs a public_key "+
 				"(a line from the .pub file): %q", path, k.User)
 		}
 	}
