@@ -53,6 +53,8 @@ type Server struct {
 	// google is nil unless google.client_id is set, which is what turns
 	// /v1/auth/google on.
 	google *googleVerifier
+	// details: see detailCache.
+	details detailCache
 }
 
 // AssetRow is one row of a resource listing (GET /v1/assets). It
@@ -394,7 +396,24 @@ func (s *Server) authorize(w http.ResponseWriter, r *http.Request, f signedField
 			fail(w, r, user.Username, http.StatusBadRequest, "on_behalf_of is too long")
 			return nil
 		}
+		if user.ID == "" {
+			// A key with no user of its own becomes the person it names, so
+			// everything downstream -- the asset listing, and Core's own
+			// permission check when the ticket is minted -- is that person's.
+			// jmsd checks no permissions itself here: Core does, per ticket.
+			person, err := s.users.ByEmail(f.OnBehalfOf)
+			if err != nil {
+				fail(w, r, user.Username, http.StatusForbidden, "on_behalf_of "+f.OnBehalfOf+" is not an active JumpServer user")
+				return nil
+			}
+			acting := *person
+			acting.Service = true
+			user = &acting
+		}
 		user.OnBehalfOf = f.OnBehalfOf
+	} else if user.Service && user.ID == "" {
+		fail(w, r, user.Username, http.StatusForbidden, "this service key has no user of its own: on_behalf_of is required")
+		return nil
 	}
 	// Recorded as soon as the signature checks out, so every line logging
 	// prints for an authenticated request names the caller.
@@ -556,9 +575,12 @@ func (s *Server) identify(fingerprint string) (*userRecord, error) {
 		if err != nil || ssh.FingerprintSHA256(pub) != fingerprint {
 			continue
 		}
-		user, err := s.users.ByUsername(k.User)
-		if err != nil {
-			return nil, err
+		// No user of its own: nobody until authorize learns who it acts for.
+		user := &userRecord{Username: "service-key"}
+		if k.User != "" {
+			if user, err = s.users.ByUsername(k.User); err != nil {
+				return nil, err
+			}
 		}
 		user.PublicKeys = []string{k.PublicKey}
 		user.Service = true

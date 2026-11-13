@@ -237,3 +237,85 @@ func TestOnBehalfOf(t *testing.T) {
 		t.Fatalf("plain request from a person's key: got %+v, want alice", u)
 	}
 }
+
+// A service key with no user of its own is the gateway's: it can only ever act
+// as the person it names, with that person's permissions. Each refusal here is
+// a way to become someone else.
+func TestServiceKeyActsAsPerson(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key, err := ssh.NewSignerFromKey(priv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{
+		cfg: Config{ServiceKeys: []ServiceKey{{
+			PublicKey: string(ssh.MarshalAuthorizedKey(key.PublicKey())),
+		}}},
+		users: newUserDirectory(func() ([]userRecord, error) {
+			return []userRecord{{ID: "u2", Username: "alice", Email: "alice@example.com"}}, nil
+		}, 0),
+		state: newMemStateStore(),
+	}
+	n := 0
+	call := func(obo, from string) (*userRecord, int) {
+		n++
+		fp := ssh.FingerprintSHA256(key.PublicKey())
+		ts, nonce := strconv.FormatInt(time.Now().Unix(), 10), fmt.Sprint("p", n)
+		payload := fp + "|" + ts + "|" + nonce
+		if obo != "" {
+			payload += "|" + OnBehalfPrefix + obo
+		}
+		sig, err := key.Sign(rand.Reader, []byte(payload))
+		if err != nil {
+			t.Fatal(err)
+		}
+		r := httptest.NewRequest(http.MethodGet, "/v1/whoami", nil)
+		r.RemoteAddr = from
+		w := httptest.NewRecorder()
+		user := srv.authorize(w, r, signedFields{Fingerprint: fp, Ts: ts, Nonce: nonce,
+			Sig: base64.StdEncoding.EncodeToString(ssh.Marshal(sig)), OnBehalfOf: obo})
+		return user, w.Code
+	}
+
+	u, _ := call("alice@example.com", "10.1.2.3:5000")
+	if u == nil || u.ID != "u2" || u.Username != "alice" || !u.Service || u.OnBehalfOf != "alice@example.com" {
+		t.Fatalf("acting for alice: got %+v, want alice's own record marked as via a service key", u)
+	}
+	if u, code := call("", "10.1.2.3:5000"); u != nil || code != http.StatusForbidden {
+		t.Fatalf("no on_behalf_of: got %+v / %d, want refused -- the key is nobody by itself", u, code)
+	}
+	if u, code := call("mallory@example.com", "10.1.2.3:5000"); u != nil || code != http.StatusForbidden {
+		t.Fatalf("unknown person: got %+v / %d, want 403", u, code)
+	}
+}
+
+// The detail cache is for programs only, per user, and forgets after detailTTL.
+func TestDetailCache(t *testing.T) {
+	now := time.Unix(1700000000, 0)
+	c := detailCache{now: func() time.Time { return now }}
+	alice := &userRecord{ID: "u2", Service: true}
+	want := AssetDetail{Accounts: []AccountOption{{Alias: "root"}}}
+
+	c.put(alice, "a1", want)
+	if got, ok := c.get(alice, "a1"); !ok || len(got.Accounts) != 1 {
+		t.Fatalf("same user and asset: got %+v / %v, want a hit", got, ok)
+	}
+	if _, ok := c.get(&userRecord{ID: "u3", Service: true}, "a1"); ok {
+		t.Fatal("another user got alice's accounts")
+	}
+	person := &userRecord{ID: "u2"}
+	c.put(person, "a2", want)
+	if _, ok := c.get(person, "a1"); ok {
+		t.Fatal("a person's own key must always ask Core")
+	}
+	if _, ok := c.get(alice, "a2"); ok {
+		t.Fatal("a person's lookup was cached")
+	}
+	now = now.Add(detailTTL)
+	if _, ok := c.get(alice, "a1"); ok {
+		t.Fatal("entry outlived detailTTL")
+	}
+}
