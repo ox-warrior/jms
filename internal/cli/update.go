@@ -61,6 +61,21 @@ func startUpdateCheck(baseURL string) <-chan *selfupdate.Release {
 	return out
 }
 
+// updateCheckFor is startUpdateCheck for a person and nothing at all for a
+// service key (-i): nil, no request to the CDN.
+//
+// A service key runs inside an image somebody pinned. Forcing an update there
+// either fails the launch (read-only binary) or silently swaps the binary the
+// image was built with; either way the machine's jms is upgraded by rebuilding
+// the image, not by itself. The cost is old clients that stay old, which is why
+// jmsd's protocol changes have to stay backward compatible.
+func updateCheckFor(identity, baseURL string) <-chan *selfupdate.Release {
+	if identity != "" {
+		return nil
+	}
+	return startUpdateCheck(baseURL)
+}
+
 // updateContact is who to ask when a forced update cannot complete.
 const updateContact = "leiyupeng"
 
