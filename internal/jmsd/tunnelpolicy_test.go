@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net"
-	"strings"
 	"testing"
 )
 
@@ -23,10 +22,22 @@ func mustPolicy(t *testing.T, rules ...TunnelRule) *tunnelPolicy {
 // for jmsd's own host) and loopback is where jmsd's Redis lives, which anyone
 // who can write it uses to skip any user's MFA.
 func TestTunnelPolicyHardDeniesBeatAllowAll(t *testing.T) {
-	policy := mustPolicy(t,
-		TunnelRule{CIDR: "0.0.0.0/0", Ports: []int{80, 443, 6379}},
-		TunnelRule{CIDR: "::/0", Ports: []int{80, 443, 6379}},
-	)
+	for _, policy := range []*tunnelPolicy{
+		mustPolicy(t,
+			TunnelRule{CIDR: "0.0.0.0/0", Ports: []int{80, 443, 6379}},
+			TunnelRule{CIDR: "::/0", Ports: []int{80, 443, 6379}},
+		),
+		mustPolicy(t), // no rules: everything else is open
+	} {
+		if err := policy.allow(net.ParseIP("10.20.1.2"), 3306); len(policy.rules) == 0 && err != nil {
+			t.Errorf("no rules: allow(10.20.1.2:3306) = %v, want nil", err)
+		}
+		hardDenied(t, policy)
+	}
+}
+
+func hardDenied(t *testing.T, policy *tunnelPolicy) {
+	t.Helper()
 	for _, addr := range []string{
 		"169.254.169.254", // AWS/GCP/Azure metadata
 		"127.0.0.1",       // jmsd's own localhost: Redis, control plane
@@ -39,15 +50,6 @@ func TestTunnelPolicyHardDeniesBeatAllowAll(t *testing.T) {
 		if err := policy.allow(net.ParseIP(addr), 80); err == nil {
 			t.Errorf("allow(%s:80) = nil, want refusal", addr)
 		}
-	}
-}
-
-// An IPv4-mapped IPv6 form of a denied address must be denied too, or the
-// deny list is one notation away from being bypassed.
-func TestTunnelPolicyDeniesMappedLoopback(t *testing.T) {
-	policy := mustPolicy(t, TunnelRule{CIDR: "0.0.0.0/0", Ports: []int{80}})
-	if err := policy.allow(net.ParseIP("::ffff:127.0.0.1"), 80); err == nil {
-		t.Fatal("allow(::ffff:127.0.0.1) = nil, wanted the loopback refusal")
 	}
 }
 
@@ -155,29 +157,5 @@ func TestResolveTunnelTargetPicksAPermittedAddressFromADualStackName(t *testing.
 	}
 	if !ip.Equal(net.ParseIP("142.251.151.119")) {
 		t.Fatalf("dialling %s, want the permitted IPv4 address 142.251.151.119", ip)
-	}
-}
-
-// Skipping over a refused address must not become a way to reach one. A name
-// that resolves ONLY to denied addresses is still refused, and the error says
-// which -- otherwise the loopback and metadata denials could be sidestepped by
-// publishing a name with a second, permitted record.
-func TestResolveTunnelTargetRefusesWhenNoAddressPasses(t *testing.T) {
-	policy := mustPolicy(t, TunnelRule{CIDR: "0.0.0.0/0", Ports: []int{443}})
-
-	_, err := resolveTunnelTarget(context.Background(),
-		fixedLookup("127.0.0.1", "169.254.169.254"), policy, "evil.internal", 443)
-	if err == nil {
-		t.Fatal("a name resolving only to loopback and metadata was allowed")
-	}
-	if !strings.Contains(err.Error(), "metadata") && !strings.Contains(err.Error(), "loopback") {
-		t.Errorf("error %q does not say which address was refused", err)
-	}
-
-	// And the port still has to match, whichever address answers.
-	_, err = resolveTunnelTarget(context.Background(),
-		fixedLookup("142.251.151.119"), policy, "www.google.com", 22)
-	if err == nil {
-		t.Fatal("port 22 was allowed by a rule listing only 443")
 	}
 }

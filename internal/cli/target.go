@@ -44,10 +44,18 @@ func parseShortcut(command string) (shortcutTarget, error) {
 // at all, or with a kind-only "-c" (nothing to connect to, so nothing to pin
 // an account on). Silently ignoring it in either case would connect as the
 // default account with no sign that --account was even noticed.
+//
+// A remote command ("-- CMD") gets the same treatment for the same reason:
+// without a named asset there is nowhere to run it, and dropping it would open
+// a TUI or a shell where the caller -- often a script or an AI agent -- asked
+// for one command's output.
 func parseCommandFlags(flags rootFlags) (*shortcutTarget, error) {
 	if flags.command == "" {
 		if flags.account != "" {
 			return nil, errors.New("--account requires -c \"type name\"")
+		}
+		if flags.remoteCommand != "" {
+			return nil, errors.New("a remote command requires -c \"type name\", as in: jms -c \"ec2 name\" -- uptime")
 		}
 		return nil, nil
 	}
@@ -57,6 +65,9 @@ func parseCommandFlags(flags rootFlags) (*shortcutTarget, error) {
 	}
 	if flags.account != "" && target.Name == "" {
 		return nil, errors.New("--account requires -c \"type name\" (a name, not just a type)")
+	}
+	if flags.remoteCommand != "" && target.Name == "" {
+		return nil, errors.New("a remote command requires -c \"type name\" (a name, not just a type)")
 	}
 	return &target, nil
 }

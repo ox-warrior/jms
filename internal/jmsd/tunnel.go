@@ -58,10 +58,10 @@ const (
 	tunnelChannelType = "direct-tcpip"
 
 	// tunnelRecheckInterval is how often a live connection re-verifies that
-	// its caller is still allowed to hold it. It matches keyIndexTTL, which
-	// bounds the other half of the same window: a key deactivated in
-	// JumpServer leaves the index within keyIndexTTL, and the connection
-	// holding it dies within one tick after that.
+	// its caller is still allowed to hold it. It matches userListTTL, which
+	// bounds the other half of the same window: a user disabled in JumpServer
+	// leaves the cached list within userListTTL, and the connection holding
+	// their key dies within one tick after that.
 	tunnelRecheckInterval = 30 * time.Second
 
 	// tunnelHandshakeTimeout bounds how long an unauthenticated peer may hold
@@ -72,16 +72,16 @@ const (
 	tunnelDialTimeout = 10 * time.Second
 
 	// TunnelMFARequiredReason is the channel-rejection message a client may
-	// act on by prompting for a TOTP code and reconnecting. It is a fixed
-	// string because the client branches on it (internal/tunnel): a lapsed MFA
-	// interval is recoverable, while a revoked key or a refused destination
+	// act on by signing in to Google again and reconnecting. It is a fixed
+	// string because the client branches on it (internal/tunnel): a lapsed
+	// sign-in is recoverable, while a revoked key or a refused destination
 	// is not, and re-prompting for the latter would loop forever.
 	//
 	// Note the asymmetry with the HTTP path, which answers 401 with
-	// {"mfa_required": true}: there, MFA lapsing mid-session is normal, and
-	// the client is expected to recover. Here it is nearly unreachable --
-	// jms clears MFA on the control plane immediately before dialling -- so
-	// the string exists for the long-lived connection whose interval expires
+	// {"mfa_required": true}: there, a sign-in lapsing mid-session is normal,
+	// and the client is expected to recover. Here it is nearly unreachable --
+	// jms signs in on the control plane immediately before dialling -- so the
+	// string exists for the long-lived connection whose binding expires
 	// underneath it, not for the connect path.
 	//
 	// Exported because internal/tunnel branches on it and a literal copied
@@ -287,21 +287,9 @@ func (s *Server) tunnelServerConfig() *ssh.ServerConfig {
 // right answer: it distinguishes nothing about why.
 func (s *Server) authTunnelKey(conn ssh.ConnMetadata, key ssh.PublicKey) (*ssh.Permissions, error) {
 	fingerprint := ssh.FingerprintSHA256(key)
-	user, err := s.users.Lookup(fingerprint)
+	user, err := s.identify(fingerprint)
 	if err != nil {
 		log.Printf("jmsd: tunnel auth refused from %s: %v", conn.RemoteAddr(), err)
-		return nil, fmt.Errorf("permission denied")
-	}
-	fresh, err := s.mfaFresh(user.Username)
-	if err != nil {
-		// A store we cannot read is not a caller we can admit: unlike the HTTP
-		// path, which answers 503 and lets the client retry, there is no way to
-		// say "try again later" inside an SSH handshake.
-		log.Printf("jmsd: tunnel auth deferred for %s: %v", user.Username, err)
-		return nil, fmt.Errorf("permission denied")
-	}
-	if !fresh {
-		log.Printf("jmsd: tunnel auth refused for %s: mfa stale", user.Username)
 		return nil, fmt.Errorf("permission denied")
 	}
 	return &ssh.Permissions{Extensions: map[string]string{
@@ -351,9 +339,14 @@ func (s *Server) serveTunnelConn(ctx context.Context, nConn net.Conn) {
 	// exactly what nobody does at 3am.
 	opened := time.Now()
 	log.Printf("jmsd: tunnel opened for %s from %s", sess.username, sess.remote)
+	s.audit.send(auditEvent{Action: auditTunnelOpen, Status: "ok", User: sess.username,
+		Remote: remoteIP(sess.remote), Fingerprint: sess.fingerprint})
 	defer func() {
 		log.Printf("jmsd: tunnel closed for %s from %s after %s, %d streams",
 			sess.username, sess.remote, time.Since(opened).Round(time.Second), sess.streamsOpened.Load())
+		s.audit.send(auditEvent{Action: auditTunnelClose, Status: "ok", User: sess.username,
+			Remote: remoteIP(sess.remote), Fingerprint: sess.fingerprint,
+			Ms: time.Since(opened).Milliseconds(), Streams: sess.streamsOpened.Load()})
 	}()
 
 	connCtx, cancel := context.WithCancel(ctx)
@@ -399,20 +392,16 @@ func (s *Server) watchTunnelSession(ctx context.Context, sess *tunnelSession) {
 }
 
 func (s *Server) recheckTunnelSession(sess *tunnelSession) error {
-	user, err := s.users.Lookup(sess.fingerprint)
-	if err != nil {
-		return fmt.Errorf("key no longer resolves: %w", err)
-	}
-	fresh, err := s.mfaFresh(user.Username)
-	if err != nil {
+	_, err := s.identify(sess.fingerprint)
+	if errors.Is(err, errStateUnavailable) {
 		// Deliberately NOT fatal to the connection: an unreachable state store
 		// is jmsd's problem, and killing every live tunnel over it would turn a
 		// Redis blip into an outage. The next tick tries again.
 		debugf("tunnel recheck for %s: state store unavailable: %v", sess.username, err)
 		return nil
 	}
-	if !fresh {
-		return errors.New("mfa interval lapsed")
+	if err != nil {
+		return fmt.Errorf("key no longer resolves: %w", err)
 	}
 	if s.cfg.Tunnel.RequirePermittedAsset {
 		// Same rule as the state store above, and more necessary: this is an
@@ -465,24 +454,23 @@ func (s *Server) handleTunnelChannel(ctx context.Context, sess *tunnelSession, n
 	// Re-checked per channel, not only on the ticker: this is the cheap half
 	// (two map lookups) and it closes the window where a stream opens in the
 	// seconds between a revocation and the next tick. It is also where the
-	// client learns a lapsed MFA interval is recoverable -- see
+	// client learns a lapsed sign-in is recoverable -- see
 	// TunnelMFARequiredReason.
-	user, err := s.users.Lookup(sess.fingerprint)
-	if err != nil {
+	_, err := s.identify(sess.fingerprint)
+	switch {
+	case errors.Is(err, errStateUnavailable):
+		// Left open, same as recheckTunnelSession -- but logged, since it has
+		// to be discoverable afterwards.
+		debugf("tunnel channel for %s: identity gate skipped, state store unavailable: %v", sess.username, err)
+	case errors.Is(err, errUnknownKey):
+		_ = newChan.Reject(ssh.Prohibited, TunnelMFARequiredReason)
+		return
+	case err != nil:
 		// ConnectionFailed, not Prohibited: the client reports Prohibited as
 		// "destination not permitted", which would send the user to read
 		// tunnel.allow when their key was actually deactivated.
 		log.Printf("jmsd: tunnel channel refused for %s: key no longer resolves: %v", sess.username, err)
 		_ = newChan.Reject(ssh.ConnectionFailed, "key no longer valid")
-		return
-	}
-	// A store error leaves this gate open, same as recheckTunnelSession -- but
-	// logged, since it has to be discoverable afterwards.
-	fresh, ferr := s.mfaFresh(user.Username)
-	if ferr != nil {
-		debugf("tunnel channel for %s: mfa gate skipped, state store unavailable: %v", sess.username, ferr)
-	} else if !fresh {
-		_ = newChan.Reject(ssh.Prohibited, TunnelMFARequiredReason)
 		return
 	}
 
@@ -496,9 +484,15 @@ func (s *Server) handleTunnelChannel(ctx context.Context, sess *tunnelSession, n
 	}
 	defer sess.channels.Add(-1) // released on every path below, rejections included
 
+	requested := net.JoinHostPort(data.DestAddr, fmt.Sprint(port))
+	denied := func(reason string) {
+		s.audit.send(auditEvent{Action: auditTunnelStream, Status: "denied", User: sess.username,
+			Remote: remoteIP(sess.remote), Requested: requested, Reason: reason})
+	}
 	ip, err := resolveTunnelTarget(ctx, net.DefaultResolver.LookupIP, s.tunnelPolicy, data.DestAddr, port)
 	if err != nil {
 		log.Printf("jmsd: tunnel denied for %s: %v", sess.username, err)
+		denied(err.Error())
 		// The client is told only that policy refused it, not which rule or
 		// which resolved address -- that detail is in jmsd's log, for the
 		// operator. It is enough for the client to stop retrying.
@@ -507,6 +501,7 @@ func (s *Server) handleTunnelChannel(ctx context.Context, sess *tunnelSession, n
 	}
 	if s.cfg.Tunnel.RequirePermittedAsset && !sess.permits(ip) {
 		log.Printf("jmsd: tunnel denied for %s: %s:%d is not a permitted asset address", sess.username, ip, port)
+		denied(fmt.Sprintf("%s:%d is not a permitted asset address", ip, port))
 		_ = newChan.Reject(ssh.Prohibited, "destination not permitted")
 		return
 	}
@@ -539,4 +534,8 @@ func (s *Server) handleTunnelChannel(ctx context.Context, sess *tunnelSession, n
 
 	log.Printf("jmsd: tunnel stream close user=%s target=%s up=%dB down=%dB duration=%s",
 		sess.username, target, up, down, time.Since(started).Round(time.Millisecond))
+	// One document per stream, written when it ends so it carries the totals.
+	s.audit.send(auditEvent{Timestamp: started, Action: auditTunnelStream, Status: "ok", User: sess.username,
+		Remote: remoteIP(sess.remote), Requested: requested, Target: target,
+		BytesUp: up, BytesDown: down, Ms: time.Since(started).Milliseconds()})
 }

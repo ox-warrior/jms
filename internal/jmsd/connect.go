@@ -125,6 +125,11 @@ type connectionRequest struct {
 	Asset    string `json:"asset"`
 	Account  string `json:"account"`
 	Protocol string `json:"protocol"`
+	// Command is the remote command a "jms -- command" run mints the ticket
+	// for, empty for an interactive session. Audited only: the ticket is not
+	// bound to it (Koko accepts any command on it), so it records what the
+	// caller declared, and Koko's own command log in Core is the authority.
+	Command string `json:"command,omitempty"`
 }
 
 // connectMethod is sent as SuperConnectTokenReq.ConnectMethod. The field is
@@ -136,7 +141,7 @@ const connectMethod = "ssh_client"
 // handleConnections mints a super-connection-token (docs/PLAN.md §4 阶段3).
 // Unlike /v1/nodes and /v1/assets it does not go through the requireSignature
 // middleware: the signature must bind asset|account|protocol -- the same
-// reason /v1/auth/mfa binds code -- so a signature captured from a read
+// reason /v1/auth/google binds the token -- so a signature captured from a read
 // call can't be replayed here to mint a ticket for an attacker-chosen asset.
 func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
 	var req connectionRequest
@@ -147,7 +152,11 @@ func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
 		fail(w, r, "", http.StatusBadRequest, "asset, account, protocol are required")
 		return
 	}
-	user := s.authorize(w, r, req.signedFields, req.Asset, req.Account, req.Protocol)
+	extra := []string{req.Asset, req.Account, req.Protocol}
+	if req.Command != "" {
+		extra = append(extra, req.Command) // signed, so it cannot be swapped in transit
+	}
+	user := s.authorize(w, r, req.signedFields, extra...)
 	if user == nil {
 		return
 	}
@@ -156,10 +165,18 @@ func (s *Server) handleConnections(w http.ResponseWriter, r *http.Request) {
 	info, err := s.core.CreateSuperConnectToken(
 		buildTokenRequest(user, req.Asset, req.Account, req.Protocol, r.RemoteAddr))
 	mintDone()
+	ev := auditEvent{Action: auditTicket, Status: "ok", User: user.Username, OnBehalfOf: user.OnBehalfOf,
+		Remote: remoteIP(r.RemoteAddr), Asset: req.Asset, Account: req.Account, Protocol: req.Protocol, Ticket: info.ID, Command: req.Command}
 	if err != nil {
+		ev.Status, ev.Reason = "error", err.Error()
+		s.audit.send(ev)
 		fail(w, r, user.Username, http.StatusBadGateway, "mint connection token: "+err.Error())
 		return
 	}
+	if info.AccountName != "" { // Core does not always return it; the id beats nothing
+		ev.Account = info.AccountName
+	}
+	s.audit.send(ev)
 	// ticket_id is included so it can be cross-referenced against Core's
 	// terminal_session and, for k8s assets, the cluster's own Audit Log when
 	// tracing who did what (docs/K9S_LOCAL_PROXY_PLAN.md §10).

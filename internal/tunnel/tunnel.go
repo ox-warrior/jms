@@ -3,20 +3,18 @@
 // dials them from inside the datacenter (see internal/jmsd/tunnel.go for the
 // server half and what it refuses).
 //
-// The MFA experience is the reason this package talks to two planes instead of
-// one. Every prompt happens on the control plane, where connectflow.WithMFA
-// and HandleMFA already know how to ask, retry a wrong code, and give up on a
-// lockout -- so a tunnel asks for a TOTP code with the same wording, the same
-// retry behaviour and the same lockout message as everything else in jms. The
-// SSH side never prompts: it either works, because MFA was just cleared, or it
-// fails opaquely, which is the right answer for someone dialling it directly
-// with a stolen key.
+// Sign-in is the reason this package talks to two planes instead of one.
+// Every sign-in happens on the control plane, where connectflow.WithMFA
+// already knows how to run it -- so a tunnel signs in exactly the way
+// everything else in jms does. The SSH side never asks: it either works,
+// because the key was just signed in, or it fails opaquely, which is the right
+// answer for someone dialling it directly with a stolen key.
 //
 // That is also why reconnecting always re-runs the control-plane call first
 // (see link.reconnect). A connection that jmsd dropped because the caller's
-// MFA interval lapsed would otherwise come back as "ssh: unable to
-// authenticate", which tells the user nothing they can act on; going through
-// /v1/tunnel-config turns it into the ordinary code prompt.
+// sign-in lapsed would otherwise come back as "ssh: unable to authenticate",
+// which tells the user nothing they can act on; going through
+// /v1/tunnel-config turns it into the ordinary Google sign-in.
 package tunnel
 
 import (
@@ -29,6 +27,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"golang.org/x/crypto/ssh"
 
@@ -41,7 +40,7 @@ import (
 // ErrDestinationRefused is what a policy refusal from jmsd looks like on this
 // side: the destination is not in tunnel.allow, or not an asset the caller may
 // reach. Distinguished from every other failure because it is the one no
-// retry, reconnect or fresh TOTP code can change.
+// retry, reconnect or fresh sign-in can change.
 var ErrDestinationRefused = errors.New("destination not permitted by jmsd")
 
 // tunnelSSHUser is sent as the SSH username. jmsd ignores it entirely --
@@ -49,8 +48,13 @@ var ErrDestinationRefused = errors.New("destination not permitted by jmsd")
 // capture or a puzzled operator's log.
 const tunnelSSHUser = "jms"
 
+// tunnelDialTimeout bounds the dial and the handshake. Ten seconds is long
+// enough for a datacenter round trip and short enough that a firewalled port
+// reports itself instead of hanging.
+const tunnelDialTimeout = 10 * time.Second
+
 // Options is what Run needs. Gate carries the jmsd client, the context and
-// the TOTP prompt; Signer is the same private key that identifies this user
+// the sign-in; Signer is the same private key that identifies this user
 // everywhere else (sshclient.LoadIdentity).
 type Options struct {
 	LocalPort int
@@ -193,7 +197,7 @@ func (l *link) reconnect(staleGen uint64) error {
 		return fmt.Errorf("parse tunnel host key: %w", err)
 	}
 
-	client, err := ssh.Dial("tcp", cfg.Addr, &ssh.ClientConfig{
+	client, err := dialTunnel(l.gate.Ctx, cfg.Addr, &ssh.ClientConfig{
 		User: tunnelSSHUser,
 		Auth: []ssh.AuthMethod{ssh.PublicKeys(l.signer)},
 		// Pinned to what the authenticated control plane just told us. This
@@ -210,6 +214,49 @@ func (l *link) reconnect(staleGen uint64) error {
 	return nil
 }
 
+// dialTunnel dials and handshakes, honouring ctx and a deadline.
+//
+// ssh.Dial does neither: it blocks until the OS gives up. A tunnel port that
+// is firewalled rather than closed drops the SYN silently, so "jms -w" hung
+// with nothing on screen and Ctrl-C did nothing -- the signal cancelled a
+// context ssh.Dial was not watching. Same shape as
+// sshclient.dialAndHandshake, which solved this for the Koko dial.
+func dialTunnel(ctx context.Context, addr string, cfg *ssh.ClientConfig) (*ssh.Client, error) {
+	dialer := net.Dialer{Timeout: tunnelDialTimeout}
+	raw, err := dialer.DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, err
+	}
+	// The handshake itself can hang too (a port that accepts and then says
+	// nothing), and it takes no context -- closing the conn is what unblocks it.
+	stop := make(chan struct{})
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = raw.Close()
+		case <-stop:
+		}
+	}()
+	_ = raw.SetDeadline(time.Now().Add(tunnelDialTimeout))
+	conn, chans, reqs, err := ssh.NewClientConn(raw, addr, cfg)
+	close(stop)
+	if err != nil {
+		_ = raw.Close()
+		// Closing raw above is how the cancellation was delivered, so the
+		// handshake blames itself: "read tcp ...: use of closed network
+		// connection", which reads like a network fault the user should go
+		// investigate. It was their own Ctrl-C. Report the cause, not the
+		// symptom.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, ctxErr
+		}
+		return nil, err
+	}
+	// Cleared once up: a tunnel stream may sit idle for hours.
+	_ = raw.SetDeadline(time.Time{})
+	return ssh.NewClient(conn, chans, reqs), nil
+}
+
 // streamOutcome is how a failed open should be treated. It is its own type
 // because the three answers lead to three different behaviours and getting one
 // wrong is visible: refusing a stream that was only transiently broken, or
@@ -220,8 +267,8 @@ const (
 	// outcomeRefused: jmsd's policy said no. No reconnect, no prompt, no
 	// retry will change it.
 	outcomeRefused streamOutcome = iota
-	// outcomeMFA: the caller's interval lapsed mid-tunnel. Ask for a code on
-	// the control plane, reconnect, and replay the stream.
+	// outcomeMFA: the caller's sign-in lapsed mid-tunnel. Sign in on the
+	// control plane, reconnect, and replay the stream.
 	outcomeMFA
 	// outcomeBroken: the connection is gone -- jmsd restarted, the laptop
 	// slept, the session was revoked. Reconnecting may fix it, and if the key
@@ -263,14 +310,13 @@ func classify(err error) streamOutcome {
 // openStream opens one channel, recovering once from a lapsed MFA interval or
 // a broken connection.
 //
-// Once, not in a loop: reconnect has already prompted and retried a wrong code
-// via HandleMFA, so a second failure means the code was accepted and the
-// stream still failed -- a real error, and re-prompting would only hide it
-// behind a prompt that can never be satisfied.
+// Once, not in a loop: reconnect has already signed in, so a second failure
+// means the sign-in was accepted and the stream still failed -- a real error,
+// and signing in again would only hide it.
 func (l *link) openStream(target socksTarget) (net.Conn, error) {
 	client, gen, err := l.get()
 	if err != nil {
-		// A previous reconnect failed partway (gave up on the TOTP prompt, jmsd
+		// A previous reconnect failed partway (gave up on the sign-in, jmsd
 		// briefly unreachable). Retrying here is what stops that one failure
 		// from killing the tunnel for the life of the process.
 		if rerr := l.reconnect(gen); rerr != nil {

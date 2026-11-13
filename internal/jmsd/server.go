@@ -9,6 +9,8 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -21,8 +23,7 @@ import (
 
 // Server is jmsd's HTTP API. It holds a Core client authenticated as its own
 // JumpServer account (docs/PLAN.md §7.1) for resource queries, and a
-// read-only connection to Core's database (§7.2) to verify a caller's SSH
-// signature and TOTP code. jmsd never touches target-asset secrets: the
+// read-only connection to Core's database (§7.2) for who is an active user. jmsd never touches target-asset secrets: the
 // perms endpoints it calls don't return them, and it never asks Core for a
 // connection token's secret.
 type Server struct {
@@ -33,15 +34,14 @@ type Server struct {
 	// unset. Only handleAssetDescribe touches it, and it checks for nil --
 	// this is a display feature and must never be able to break a connection.
 	inventory *InventoryDB
-	// users resolves a caller's key fingerprint to a JumpServer user from a
-	// cached index, so an unauthenticated caller cannot drive Core's database
-	// by sending forged signatures -- see userDirectory.
+	// users is a cached list of Core's active users, so an unauthenticated
+	// caller cannot drive Core's database by sending forged signatures --
+	// see userDirectory.
 	users *userDirectory
-	// mfaFailures caps how many wrong TOTP codes one user may submit before
-	// the endpoint stops answering -- see failureTracker.
-	mfaFailures *failureTracker
-	state       StateStore
-	// stateDesc names the state backend for the log, so "mfa verified" says
+	state StateStore
+	// audit ships what people did to Elasticsearch; nil when audit_es is unset.
+	audit *auditShipper
+	// stateDesc names the state backend for the log, so a sign-in says
 	// where it was persisted instead of leaving that to be checked by hand.
 	stateDesc string
 	// tunnelSigner and tunnelPolicy are nil unless tunnel.enabled. Both are
@@ -50,6 +50,9 @@ type Server struct {
 	// compile must fail the start rather than every later connection.
 	tunnelSigner ssh.Signer
 	tunnelPolicy *tunnelPolicy
+	// google is nil unless google.client_id is set, which is what turns
+	// /v1/auth/google on.
+	google *googleVerifier
 }
 
 // AssetRow is one row of a resource listing (GET /v1/assets). It
@@ -134,29 +137,26 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
-	coreDB, err := NewCoreDB(cfg.CoreDBDSN, cfg.SecretKey)
+	coreDB, err := NewCoreDB(cfg.CoreDBDSN)
 	if err != nil {
 		return nil, err
 	}
-	// No redis block configured keeps the original in-memory behaviour, so
-	// existing deployments need no config change -- they just keep losing MFA
-	// state on restart. Which store won is logged, and named again on every
-	// "mfa verified" line, because the two are otherwise indistinguishable
-	// from outside: an omitted redis block looks exactly like a working one
-	// until someone restarts jmsd and finds themselves retyping a TOTP code
-	// with no way to tell whether the feature is off or broken.
+	// No redis block keeps auth state in memory, lost on restart. Which store
+	// won is logged, and named again on every sign-in line, because the two
+	// are otherwise indistinguishable from outside until someone restarts
+	// jmsd and everybody is asked to sign in again.
 	var state StateStore = newMemStateStore()
 	stateDesc := "process memory"
 	if cfg.Redis.Addr != "" {
-		state, err = newRedisStateStore(cfg.Redis, time.Duration(cfg.MFAIntervalDays)*24*time.Hour)
+		state, err = newRedisStateStore(cfg.Redis)
 		if err != nil {
 			_ = coreDB.Close()
 			return nil, err
 		}
 		stateDesc = fmt.Sprintf("redis %s db %d", cfg.Redis.Addr, cfg.Redis.DB)
-		log.Printf("jmsd: auth state in %s, MFA survives restarts", stateDesc)
+		log.Printf("jmsd: auth state in %s, sign-ins survive restarts", stateDesc)
 	} else {
-		log.Printf("jmsd: auth state in %s, every restart re-prompts MFA (set redis.addr to persist it)", stateDesc)
+		log.Printf("jmsd: auth state in %s, every restart signs everyone out (set redis.addr to persist it)", stateDesc)
 	}
 	// Opened eagerly, like coreDB, so a wrong DSN surfaces at startup rather
 	// than the first time somebody presses "d". Fatal on purpose: the admin
@@ -183,14 +183,20 @@ func New(cfg Config) (*Server, error) {
 		log.Printf("jmsd: no inventory_db_dsn, the \"d\" panel will report no cloud metadata")
 	}
 	srv := &Server{
-		cfg:         cfg,
-		core:        core,
-		coreDB:      coreDB,
-		inventory:   inv,
-		users:       newUserDirectory(coreDB.activeSSHKeys, keyIndexTTL),
-		mfaFailures: newFailureTracker(mfaMaxFailures, mfaLockout),
-		state:       state,
-		stateDesc:   stateDesc,
+		cfg:       cfg,
+		core:      core,
+		coreDB:    coreDB,
+		inventory: inv,
+		users:     newUserDirectory(coreDB.activeUsers, userListTTL),
+		state:     state,
+		stateDesc: stateDesc,
+		google:    newGoogleVerifier(cfg.Google),
+	}
+	log.Printf("jmsd: Google sign-in for %s accounts", cfg.Google.HostedDomain)
+	if cfg.AuditES != "" {
+		host, _ := os.Hostname()
+		srv.audit = newAuditShipper(cfg.AuditES, host)
+		log.Printf("jmsd: audit events go to %s, index %s<date>", cfg.AuditES, auditPrefix)
 	}
 	if cfg.Tunnel.Enabled {
 		if srv.tunnelSigner, err = loadOrCreateTunnelHostKey(cfg.Tunnel.HostKey); err != nil {
@@ -228,9 +234,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("/v1/assets/detail", s.requireSignature(s.handleAssetDetail))
 	mux.HandleFunc("/v1/assets/describe", s.requireSignature(s.handleDescribe))
 	mux.HandleFunc("/v1/marks", s.requireSignature(s.handleMarks))
-	mux.HandleFunc("/v1/auth/mfa", s.handleMFA)
+	mux.HandleFunc("/v1/auth/google", s.handleGoogleSignIn)
 	mux.HandleFunc("/v1/favorites", s.handleSetFavorite)
 	mux.HandleFunc("/v1/connections", s.handleConnections)
+	mux.HandleFunc("/v1/query", s.handleQuery)
 	return logging(mux)
 }
 
@@ -281,7 +288,7 @@ type favoriteRequest struct {
 }
 
 // handleSetFavorite stars or unstars one asset for the calling user. Like
-// /v1/connections and /v1/auth/mfa it bypasses the requireSignature
+// /v1/connections and /v1/auth/google it bypasses the requireSignature
 // middleware, because the signature has to cover the asset and the desired
 // state -- otherwise a signature captured from a read call could be replayed
 // to star or unstar an attacker-chosen asset.
@@ -334,6 +341,8 @@ type signedFields struct {
 	Ts          string `json:"ts"`
 	Nonce       string `json:"nonce"`
 	Sig         string `json:"sig"`
+	// OnBehalfOf: see userRecord.OnBehalfOf. Optional, service keys only.
+	OnBehalfOf string `json:"on_behalf_of,omitempty"`
 }
 
 func (f signedFields) complete() bool {
@@ -347,40 +356,49 @@ type signedBody interface{ signature() signedFields }
 func (f signedFields) signature() signedFields { return f }
 
 // authorize is the gate every endpoint passes through: it verifies the
-// signature over "fingerprint|ts|nonce" plus extra (in order), then checks
-// that the caller's last MFA verification is still within
-// cfg.MFAIntervalDays. On failure it answers the client itself and returns
-// nil, which the caller must treat as "stop here".
+// signature over "fingerprint|ts|nonce" plus extra (in order) against the
+// caller's service key or Google-bound key. On failure it answers the client
+// itself and returns nil, which the caller must treat as "stop here".
 //
 // extra is what separates a read from a write. Reads sign nothing beyond the
 // three base fields; every POST binds its own arguments in, so a signature
-// captured from a read cannot be replayed to mint a token, star an asset, or
-// submit a TOTP code of the attacker's choosing.
+// captured from a read cannot be replayed to mint a token or star an asset of
+// the attacker's choosing.
 func (s *Server) authorize(w http.ResponseWriter, r *http.Request, f signedFields, extra ...string) *userRecord {
+	if f.OnBehalfOf != "" {
+		// Signed in last, matching jmsdclient: unsigned, anyone could relabel
+		// a captured request as someone else's.
+		extra = append(slices.Clip(extra), OnBehalfPrefix+f.OnBehalfOf)
+	}
 	user, err := s.verifySignedRequest(f.Fingerprint, f.Ts, f.Nonce, f.Sig, extra...)
+	if errors.Is(err, errUnknownKey) {
+		// jms's key before its first Google sign-in, or after the binding
+		// lapsed. "mfa_required" is the wire name jms already reacts to by
+		// running the sign-in; nothing was verified, so there is no username.
+		note(r, "", "unknown key, sign-in required")
+		writeJSONStatus(w, http.StatusUnauthorized, map[string]any{"mfa_required": true})
+		return nil
+	}
 	if err != nil {
 		fail(w, r, "", authFailureStatus(err), err.Error())
 		return nil
 	}
+	if f.OnBehalfOf != "" {
+		// A person's own key acts for that person; letting it name someone
+		// else would let anyone put another name in the audit.
+		if !user.Service {
+			fail(w, r, user.Username, http.StatusForbidden, "on_behalf_of is only accepted from a service key")
+			return nil
+		}
+		if len(f.OnBehalfOf) > 254 {
+			fail(w, r, user.Username, http.StatusBadRequest, "on_behalf_of is too long")
+			return nil
+		}
+		user.OnBehalfOf = f.OnBehalfOf
+	}
 	// Recorded as soon as the signature checks out, so every line logging
-	// prints for an authenticated request names the caller -- handlers past
-	// this point never have to repeat it.
+	// prints for an authenticated request names the caller.
 	note(r, user.Username, "")
-	fresh, err := s.mfaFresh(user.Username)
-	if err != nil {
-		fail(w, r, user.Username, http.StatusServiceUnavailable, err.Error())
-		return nil
-	}
-	if !fresh {
-		note(r, user.Username, "mfa required")
-		// Username is included here (not just mfa_required) so jms can show it
-		// in the MFA prompt even on the very first request, before it has ever
-		// received a successful response of any kind -- resolving the
-		// fingerprint to a user doesn't require a fresh MFA check, so jmsd
-		// already knows it at this point.
-		writeJSONStatus(w, http.StatusUnauthorized, map[string]any{"mfa_required": true, "username": user.Username})
-		return nil
-	}
 	return user
 }
 
@@ -418,6 +436,7 @@ func (s *Server) requireSignature(next authedHandler) http.HandlerFunc {
 		q := r.URL.Query()
 		fields := signedFields{
 			Fingerprint: q.Get("fp"), Ts: q.Get("ts"), Nonce: q.Get("nonce"), Sig: q.Get("sig"),
+			OnBehalfOf: q.Get("on_behalf_of"),
 		}
 		if !fields.complete() {
 			fail(w, r, "", http.StatusBadRequest, "fp, ts, nonce, sig are required")
@@ -431,76 +450,76 @@ func (s *Server) requireSignature(next authedHandler) http.HandlerFunc {
 	}
 }
 
-// mfaRequest is the body of POST /v1/auth/mfa.
-type mfaRequest struct {
+// googleSignInRequest is the body of POST /v1/auth/google. PublicKey is the
+// caller's key in authorized_keys form: the key may be one jmsd has never
+// seen, so the request has to bring it along to be verifiable at all.
+type googleSignInRequest struct {
 	signedFields
-	Code string `json:"code"`
+	PublicKey string `json:"public_key"`
+	IDToken   string `json:"id_token"`
 }
 
-// handleMFA verifies a TOTP code and, on success, records the resolved user
-// as having completed MFA just now, resetting its cfg.MFAIntervalDays clock.
-// The signature covers "fingerprint|ts|nonce|code" rather than just
-// "fingerprint|ts|nonce" so a signature captured from a nodes/assets call
-// can't be replayed here against an attacker-chosen code.
-func (s *Server) handleMFA(w http.ResponseWriter, r *http.Request) {
-	var req mfaRequest
+// handleGoogleSignIn turns a Google sign-in into an identity for the caller's
+// key: it binds the key to the JumpServer user with the Google account's
+// email, for mfa_interval_days.
+//
+// The ID token is bound in twice: it is part of what the key signed, and it
+// must carry this request's nonce (see googleVerifier.verify) -- so it can be
+// neither moved to another request nor submitted twice.
+func (s *Server) handleGoogleSignIn(w http.ResponseWriter, r *http.Request) {
+	var req googleSignInRequest
 	if !decodeSignedPost(w, r, &req) {
 		return
 	}
-	if req.Code == "" {
-		fail(w, r, "", http.StatusBadRequest, "code is required")
+	if req.IDToken == "" || req.PublicKey == "" {
+		fail(w, r, "", http.StatusBadRequest, "public_key and id_token are required")
 		return
 	}
-	// Not authorize(): this endpoint is how a lapsed caller gets back in, so
-	// it verifies the signature without also demanding fresh MFA.
-	user, err := s.verifySignedRequest(req.Fingerprint, req.Ts, req.Nonce, req.Sig, req.Code)
-	if err != nil {
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(req.PublicKey))
+	if err != nil || ssh.FingerprintSHA256(pub) != req.Fingerprint {
+		fail(w, r, "", http.StatusBadRequest, "public_key does not match fp")
+		return
+	}
+	if err := s.checkFreshness(req.Ts, req.Nonce); err != nil {
 		fail(w, r, "", authFailureStatus(err), err.Error())
 		return
 	}
-	// Checked before the code is even looked at, and keyed on the user rather
-	// than the caller's address: whoever is guessing already holds a private
-	// key that signs as this user, so the account is the only thing worth
-	// rate-limiting -- and it is the one identifier they cannot vary.
-	if remaining, locked := s.mfaFailures.LockedFor(user.Username); locked {
-		fail(w, r, user.Username, http.StatusTooManyRequests, fmt.Sprintf(
-			"too many incorrect MFA codes; try again in %s", remaining.Round(time.Second)))
+	// Proves the caller holds the private half, so nobody can bind a key
+	// they merely saw.
+	if err := verifySignature([]string{req.PublicKey}, req.Fingerprint, req.Ts, req.Nonce, req.Sig, req.PublicKey, req.IDToken); err != nil {
+		fail(w, r, "", http.StatusUnauthorized, err.Error())
 		return
 	}
-	if user.OTPSecretKey == "" {
-		// Not counted as a failure: nothing was guessed, the account simply has
-		// no device enrolled, and locking it out would only bury the real cause.
-		fail(w, r, user.Username, http.StatusBadRequest, "user has no MFA device enrolled in JumpServer")
+	email, err := s.google.verify(req.IDToken, req.Nonce)
+	if err != nil {
+		fail(w, r, "", http.StatusUnauthorized, err.Error())
 		return
 	}
-	if !verifyTOTP(user.OTPSecretKey, req.Code) {
-		if s.mfaFailures.Fail(user.Username) {
-			// Logged unconditionally, unlike the individual wrong codes: a
-			// lockout engaging is either someone fatfingering a code five times
-			// or someone working through the keyspace with a stolen SSH key,
-			// and the second one is worth having a timestamped record of.
-			log.Printf("jmsd: mfa lockout: %s reached %d consecutive incorrect codes, refusing for %s",
-				user.Username, mfaMaxFailures, mfaLockout)
-		}
-		fail(w, r, user.Username, http.StatusUnauthorized, "invalid code")
+	// Audited from here: before this point nothing names a person, and a
+	// garbage request is not worth a document.
+	ev := auditEvent{Action: auditSignin, Status: "ok", Remote: remoteIP(r.RemoteAddr),
+		Email: email, Fingerprint: req.Fingerprint}
+	user, err := s.users.ByEmail(email)
+	if err != nil {
+		ev.Status, ev.Reason = "denied", err.Error()
+		s.audit.send(ev)
+		fail(w, r, "", http.StatusForbidden, err.Error())
 		return
 	}
-	// Cleared on success: the threshold counts CONSECUTIVE failures, so a
-	// couple of mistyped codes must not accumulate across weeks into a lockout.
-	s.mfaFailures.Reset(user.Username)
-	// A failure to record must not answer 200. The code was correct, but
-	// without the record the very next request finds MFA still stale and
-	// re-prompts -- so reporting success would leave the user staring at a
-	// prompt jmsd just told them they'd cleared.
-	if err := s.state.RecordMFA(user.Username, time.Now()); err != nil {
+	ev.User = user.Username
+	// The binding's expiry is the sign-in interval: when it lapses the key
+	// is unknown again and jms is sent back to the browser.
+	until := time.Now().Add(time.Duration(s.cfg.MFAIntervalDays) * 24 * time.Hour)
+	if err := s.state.BindKey(req.Fingerprint, keyBinding{UserID: user.ID, PublicKey: req.PublicKey}, until); err != nil {
+		ev.Status, ev.Reason = "error", err.Error()
+		s.audit.send(ev)
 		fail(w, r, user.Username, http.StatusServiceUnavailable, err.Error())
 		return
 	}
-	// Naming the backend here is the answer to "did it actually persist?"
-	// without anyone having to go read the store's keys by hand.
-	note(r, user.Username, fmt.Sprintf("mfa verified, recorded in %s, next prompt in %dd",
-		s.stateDesc, s.cfg.MFAIntervalDays))
-	writeJSON(w, map[string]string{"status": "ok"})
+	s.audit.send(ev)
+	note(r, user.Username, fmt.Sprintf("signed in via Google as %s, key %s bound in %s for %dd",
+		email, req.Fingerprint, s.stateDesc, s.cfg.MFAIntervalDays))
+	writeJSON(w, map[string]string{"status": "ok", "username": user.Username})
 }
 
 // verifySignedRequest checks the timestamp window, replay via nonce, resolves
@@ -509,71 +528,100 @@ func (s *Server) handleMFA(w http.ResponseWriter, r *http.Request) {
 // registered public keys. It returns the user record so callers get the
 // JumpServer user id without a second lookup.
 func (s *Server) verifySignedRequest(fingerprint, ts, nonce, sig string, extra ...string) (*userRecord, error) {
-	tsSeconds, err := strconv.ParseInt(ts, 10, 64)
-	if err != nil {
-		return nil, fmt.Errorf("invalid ts")
-	}
-	if age := time.Since(time.Unix(tsSeconds, 0)); age < -nonceWindow || age > nonceWindow {
-		return nil, fmt.Errorf("timestamp outside allowed window")
-	}
-	seen, err := s.state.SeenNonce(nonce)
-	if err != nil {
+	if err := s.checkFreshness(ts, nonce); err != nil {
 		return nil, err
 	}
-	if seen {
-		return nil, fmt.Errorf("nonce already used")
-	}
-
-	// Served from userDirectory's cached index, so this is a map lookup rather
-	// than the full decrypt-and-hash scan of every active key in the install
-	// that it used to be. It still has to happen before the signature check --
-	// there is no verifying a signature without first knowing whose keys to
-	// try -- which is exactly why it must not touch the database per request.
+	// Before the signature check by necessity -- there is no verifying a
+	// signature without first knowing whose key to try -- which is why it is
+	// served from the state store and a cached user list, never the database.
 	lookupDone := timed("resolve fingerprint %s", fingerprint)
-	user, err := s.users.Lookup(fingerprint)
+	user, err := s.identify(fingerprint)
 	lookupDone()
 	if err != nil {
 		return nil, err
 	}
-	if len(user.PublicKeys) == 0 {
-		return nil, fmt.Errorf("user has no active SSH key registered in JumpServer")
+	if err := verifySignature(user.PublicKeys, fingerprint, ts, nonce, sig, extra...); err != nil {
+		return nil, err
 	}
+	return user, nil
+}
 
+// identify resolves a key to its owner: a service key from the config, or a
+// key a Google sign-in bound. Either way the owner must still be active in
+// JumpServer -- the directory lookup fails otherwise -- so disabling a user
+// there cuts them off within userListTTL.
+func (s *Server) identify(fingerprint string) (*userRecord, error) {
+	for _, k := range s.cfg.ServiceKeys {
+		pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(k.PublicKey))
+		if err != nil || ssh.FingerprintSHA256(pub) != fingerprint {
+			continue
+		}
+		user, err := s.users.ByUsername(k.User)
+		if err != nil {
+			return nil, err
+		}
+		user.PublicKeys = []string{k.PublicKey}
+		user.Service = true
+		return user, nil
+	}
+	b, ok, err := s.state.BoundKey(fingerprint)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return nil, errUnknownKey
+	}
+	user, err := s.users.ByID(b.UserID)
+	if err != nil {
+		return nil, err
+	}
+	// Only the bound key verifies for this request: the user's registered
+	// keys are not what the caller claimed to sign with.
+	user.PublicKeys = []string{b.PublicKey}
+	return user, nil
+}
+
+// checkFreshness enforces the timestamp window and consumes the nonce.
+func (s *Server) checkFreshness(ts, nonce string) error {
+	tsSeconds, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil {
+		return fmt.Errorf("invalid ts")
+	}
+	if age := time.Since(time.Unix(tsSeconds, 0)); age < -nonceWindow || age > nonceWindow {
+		return fmt.Errorf("timestamp outside allowed window")
+	}
+	seen, err := s.state.SeenNonce(nonce)
+	if err != nil {
+		return err
+	}
+	if seen {
+		return fmt.Errorf("nonce already used")
+	}
+	return nil
+}
+
+// verifySignature checks sig over "fingerprint|ts|nonce|extra..." against
+// any of keys (authorized_keys format).
+func verifySignature(keys []string, fingerprint, ts, nonce, sig string, extra ...string) error {
 	sigBytes, err := base64.StdEncoding.DecodeString(sig)
 	if err != nil {
-		return nil, fmt.Errorf("invalid signature encoding")
+		return fmt.Errorf("invalid signature encoding")
 	}
 	var signature ssh.Signature
 	if err := ssh.Unmarshal(sigBytes, &signature); err != nil {
-		return nil, fmt.Errorf("invalid signature encoding")
+		return fmt.Errorf("invalid signature encoding")
 	}
-
 	payload := strings.Join(append([]string{fingerprint, ts, nonce}, extra...), "|")
-	for _, raw := range user.PublicKeys {
+	for _, raw := range keys {
 		pubKey, _, _, _, err := ssh.ParseAuthorizedKey([]byte(raw))
 		if err != nil {
 			continue // skip one unparseable stored key rather than fail the request
 		}
 		if pubKey.Verify([]byte(payload), &signature) == nil {
-			return user, nil
+			return nil
 		}
 	}
-	return nil, fmt.Errorf("signature verification failed against every registered SSH key")
-}
-
-func (s *Server) mfaFresh(username string) (bool, error) {
-	last, ok, err := s.state.LastMFA(username)
-	if err != nil {
-		return false, err
-	}
-	if !ok {
-		return false, nil
-	}
-	// Compared here rather than left to the store's own expiry: the Redis
-	// backend fixes an MFA key's TTL when it writes it, so shortening
-	// mfa_interval_days afterwards would otherwise leave old keys honoured
-	// for longer than the new setting allows.
-	return time.Since(last) < time.Duration(s.cfg.MFAIntervalDays)*24*time.Hour, nil
+	return fmt.Errorf("signature verification failed")
 }
 
 // authFailureStatus separates "we could not authenticate you" from "we could

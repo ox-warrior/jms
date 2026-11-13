@@ -48,3 +48,25 @@ func TestParseShortcutRejectsWrongFieldCount(t *testing.T) {
 		}
 	}
 }
+
+// A remote command with nowhere to run must fail, not be dropped: dropped, it
+// opens a TUI or a shell under a caller (often an AI agent) that asked for one
+// command's output and has no way to answer either.
+func TestRemoteCommandNeedsANamedAsset(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		flags   rootFlags
+		wantErr bool
+	}{
+		{name: "named asset", flags: rootFlags{command: "ec2 ng0", remoteCommand: "uptime"}},
+		{name: "no -c", flags: rootFlags{remoteCommand: "uptime"}, wantErr: true},
+		{name: "kind only", flags: rootFlags{command: "ec2", remoteCommand: "uptime"}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := parseCommandFlags(tc.flags)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("parseCommandFlags(%+v) error = %v, wantErr %t", tc.flags, err, tc.wantErr)
+			}
+		})
+	}
+}

@@ -72,10 +72,10 @@ func PrepareK8s(gate *Gate, k9sPathOverride string) (*K8sPrep, error) {
 
 // MintTicket mints a connection ticket for one asset+account+protocol
 // (docs/PLAN.md §4 阶段3).
-func MintTicket(gate *Gate, assetID, assetName, account, protocol string) (jmsd.ConnectionTicket, error) {
+func MintTicket(gate *Gate, assetID, assetName, account, protocol, command string) (jmsd.ConnectionTicket, error) {
 	donePhase := jmslog.Phase("connect %s: mint ticket", assetName)
 	ticket, err := WithMFA(gate, func() (jmsd.ConnectionTicket, error) {
-		return gate.JC.Connect(gate.Ctx, assetID, account, protocol)
+		return gate.JC.Connect(gate.Ctx, assetID, account, protocol, command)
 	})
 	donePhase(err)
 	if err != nil {

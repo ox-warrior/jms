@@ -6,30 +6,27 @@
 // is what stops two connection paths leaving different audit trails for what
 // looks like the same action.
 //
-// It knows nothing about tview: a caller that owns a display supplies a Prompt
-// and gets plain errors back.
+// It knows nothing about tview: a caller that owns a display supplies an
+// Authenticate and gets plain errors back.
 package connectflow
 
 import (
 	"context"
 	"errors"
-	"net/http"
+	"sync"
+	"time"
 
+	"github.com/leiyupeng/jumpserver-cli/internal/googlelogin"
 	"github.com/leiyupeng/jumpserver-cli/internal/jmsdclient"
 )
 
-// Prompt asks the user for a fresh TOTP code, or errors if they gave up (Esc
-// in the TUI's modal; Ctrl+D/Ctrl+C on the CLI's tty read). errMsg is the
-// previous attempt's rejection reason, or "" on the first try.
-type Prompt func(ctx context.Context, username, errMsg string) (code string, err error)
-
-// ErrCancelled is what HandleMFA and WithMFA return when Prompt reports the
-// user gave up rather than jmsd refusing a code. Callers prefix it with what
+// ErrCancelled is what WithMFA returns when the user gave up the sign-in
+// rather than jmsd refusing it. Callers prefix it with what
 // they were attempting: "load scope failed: MFA required · cancelled".
 var ErrCancelled = errors.New("MFA required · cancelled")
 
 // Gate carries the jmsd client and context every call in this package runs
-// against, plus what WithMFA needs to recover from a lapsed MFA interval. One
+// against, plus what WithMFA needs to sign the key in again when jmsd no longer knows it. One
 // is built per operation, since Ctx and Username differ per call. Holding both
 // here is what keeps the step functions from taking a second, separately
 // passed copy that could disagree with it.
@@ -39,82 +36,76 @@ type Gate struct {
 	// Username is only for display in the prompt. Empty is legitimate before
 	// the caller has learned its own name -- see WithMFA.
 	Username string
-	Prompt   Prompt
 	// Around wraps the prompt so a caller that already owns the screen can
 	// get out of its way first (the TUI hides its "Connecting…" modal while
 	// asking). Nil prompts directly -- what a plain terminal prompt needs.
 	Around func(ask func() error) error
+	// Authenticate gets the key signed in again: a Google sign-in (see
+	// GoogleSignIn) where a human is present, an explanatory error where not.
+	Authenticate func(ctx context.Context, username string) error
 }
 
+// authMu and authDone serialise Authenticate across the whole process. The
+// TUI loads the asset list and the marks concurrently, and right after MFA
+// lapses both come back mfa_required at once; without this, each would open
+// its own browser tab. The second caller waits, sees the first one has just
+// succeeded, and goes straight to retrying its call.
+var (
+	authMu   sync.Mutex
+	authDone time.Time
+)
+
 func (g *Gate) ask(username string) error {
-	handle := func() error { return HandleMFA(g.Ctx, g.JC, username, g.Prompt) }
+	handle := func() error {
+		authMu.Lock()
+		defer authMu.Unlock()
+		if time.Since(authDone) < time.Minute {
+			return nil
+		}
+		if err := g.Authenticate(g.Ctx, username); err != nil {
+			return err
+		}
+		authDone = time.Now()
+		return nil
+	}
 	if g.Around == nil {
 		return handle()
 	}
 	return g.Around(handle)
 }
 
-// WithMFA runs call and, if jmsd reports the caller's MFA interval has
-// lapsed, prompts for a code and runs it exactly once more. Every jmsd call
+// GoogleSignIn signs the key in with Google: the browser flow for an ID token,
+// then the token to jmsd, which binds the key to the JumpServer user with
+// that email. show receives the sign-in URL, for when no browser opens.
+func GoogleSignIn(ctx context.Context, jc *jmsdclient.Client, client googlelogin.Client, show func(url string)) error {
+	nonce, err := jmsdclient.NewNonce()
+	if err != nil {
+		return err
+	}
+	idToken, err := client.SignIn(ctx, nonce, show)
+	if err != nil {
+		return err
+	}
+	return jc.VerifyGoogle(ctx, nonce, idToken)
+}
+
+// WithMFA runs call and, if jmsd reports the key is not signed in (never, or
+// the interval lapsed), signs in and runs it exactly once more. Every jmsd call
 // in this package's pipeline goes through it: MFA can lapse between any two
 // requests, so handling it at only some call sites would leave the rest
 // failing with an error the user can do nothing about.
 //
-// Once, not in a loop: HandleMFA already retries a wrong code, so a second
-// failure here means MFA was accepted and the call still failed -- which is a
-// real error, not something re-prompting can fix.
+// Once, not in a loop: a second failure means the sign-in was accepted and
+// the call still failed -- a real error, not something re-signing-in fixes.
 func WithMFA[T any](g *Gate, call func() (T, error)) (T, error) {
 	out, err := call()
 	var mfaErr *jmsdclient.MFARequiredError
-	if !errors.As(err, &mfaErr) {
+	if !errors.As(err, &mfaErr) { // the name predates Google sign-in: it means "not signed in"
 		return out, err
 	}
-	// jmsd resolves the caller's fingerprint to a user before checking MFA
-	// freshness, so even the first request comes back naming them -- which is
-	// what lets a startup prompt show a username, not a fingerprint.
-	username := g.Username
-	if username == "" {
-		username = mfaErr.Username
-	}
-	if err := g.ask(username); err != nil {
+	if err := g.ask(g.Username); err != nil {
 		var zero T
 		return zero, err
 	}
 	return call()
-}
-
-// HandleMFA asks for a TOTP code and submits it to jmsd, retrying on a wrong
-// code until the user succeeds, cancels, or hits something no further code can
-// satisfy. It returns nil once jmsd accepts a code.
-//
-// That last case is why this inspects the rejection reason rather than just
-// "did it fail": a locked-out account (429, for fifteen minutes) and one with
-// no enrolled device (400) are refused with errors that stay true whatever is
-// typed next, so retrying them reopens the prompt forever with cancelling the
-// only way out.
-func HandleMFA(ctx context.Context, jc *jmsdclient.Client, username string, prompt Prompt) error {
-	errMsg := ""
-	for {
-		code, err := prompt(ctx, username, errMsg)
-		if err != nil {
-			return ErrCancelled
-		}
-		err = jc.VerifyMFA(ctx, code)
-		if err == nil {
-			return nil
-		}
-		if !MFACodeRejected(err) {
-			return err
-		}
-		errMsg = err.Error()
-	}
-}
-
-// MFACodeRejected reports whether an error from VerifyMFA means "that code was
-// wrong". 401 is the only rejection a fresh code can fix; everything else -- a
-// lockout, a missing device, an unreachable state store, a transport failure
-// with no status at all -- goes back to the caller instead of re-prompting.
-func MFACodeRejected(err error) bool {
-	var status *jmsdclient.StatusError
-	return errors.As(err, &status) && status.Code == http.StatusUnauthorized
 }

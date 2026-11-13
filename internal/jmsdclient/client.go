@@ -18,11 +18,13 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"maps"
 	"net/http"
 	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -34,28 +36,20 @@ import (
 )
 
 // MFARequiredError is what every signed call returns when jmsd reports the
-// caller's last MFA verification is stale. Callers should prompt for a TOTP
-// code, call VerifyMFA, and retry the original request (see
-// internal/tui.withMFA).
-//
-// It carries Username because jmsd resolves the caller's fingerprint to a user
-// before it ever checks MFA freshness, so it already knows this even on the
-// very first call this process makes (see internal/jmsd.Server.authorize) --
-// letting the UI show a real username in the MFA prompt instead of falling
-// back to the fingerprint.
-type MFARequiredError struct {
-	Username string
-}
+// caller's key is not signed in -- never was, or the binding lapsed. Callers
+// sign in with Google (VerifyGoogle) and retry the original request (see
+// connectflow.WithMFA). The name, and the "mfa_required" it is decoded from,
+// predate Google sign-in; renaming the wire field would break every deployed
+// jms at once.
+type MFARequiredError struct{}
 
 func (e *MFARequiredError) Error() string { return "mfa required" }
 
 // StatusError is any other refusal from jmsd, carrying the HTTP status
 // alongside jmsd's own message.
 //
-// The status is not decoration. Callers that retry have to tell a rejected
-// input from a condition no retry can satisfy: the MFA prompt loops on 401
-// ("invalid code") but must give up on 429 (locked out for 15 minutes) and on
-// 400 ("no MFA device enrolled"), neither of which another code can fix.
+// The status is kept so a caller can tell jmsd refusing the request (4xx)
+// from jmsd failing to serve it (5xx).
 type StatusError struct {
 	Code    int
 	Path    string
@@ -72,6 +66,11 @@ type Client struct {
 	fingerprint string
 	signer      ssh.Signer
 	httpClient  *http.Client
+	// OnBehalfOf names the person a service key is acting for (the gateway
+	// that holds the key knows who asked; jmsd cannot). Signed into every
+	// request so it cannot be swapped in transit, and recorded in jmsd's
+	// audit. jmsd refuses it from anything but a service key.
+	OnBehalfOf string
 }
 
 // New returns a Client for signer (typically from sshclient.LoadIdentity --
@@ -135,10 +134,11 @@ func (c *Client) K8sConfig(ctx context.Context) (jmsd.K8sConfigResponse, error) 
 // present (GET /v1/tunnel-config). An empty Addr means the operator has not
 // enabled the tunnel.
 //
-// This call is also what enforces MFA for the tunnel: it runs through jmsd's
-// ordinary authorize(), so a lapsed interval comes back as MFARequiredError
-// here -- on the control plane, where connectflow.WithMFA already knows how to
-// prompt -- rather than as an opaque SSH authentication failure later.
+// This call is also what signs the tunnel's key in: it runs through jmsd's
+// ordinary authorize(), so an unknown or lapsed key comes back as
+// MFARequiredError here -- on the control plane, where connectflow.WithMFA
+// opens the Google sign-in -- rather than as an opaque SSH authentication
+// failure later.
 func (c *Client) TunnelConfig(ctx context.Context) (jmsd.TunnelConfigResponse, error) {
 	return get[jmsd.TunnelConfigResponse](ctx, c, "/v1/tunnel-config", nil)
 }
@@ -175,11 +175,17 @@ func (c *Client) SetFavorite(ctx context.Context, assetID string, starred bool) 
 	)
 }
 
-// VerifyMFA submits a TOTP code to jmsd (POST /v1/auth/mfa). On success,
-// jmsd resets the caller's MFA-interval clock, and subsequent Nodes/Assets
-// calls stop returning MFARequiredError until it lapses again.
-func (c *Client) VerifyMFA(ctx context.Context, code string) error {
-	return c.postSigned(ctx, "/v1/auth/mfa", []string{code}, map[string]any{"code": code}, nil)
+// VerifyGoogle submits a Google ID token to sign this key in (POST
+// /v1/auth/google). nonce must be the one the Google sign-in was started with:
+// jmsd requires the token to carry this request's nonce, which is what stops
+// a token from being replayed or moved to another request.
+//
+// The public key travels with it because jmsd may never have seen this key:
+// the sign-in is what binds it to a JumpServer user.
+func (c *Client) VerifyGoogle(ctx context.Context, nonce, idToken string) error {
+	pub := strings.TrimSpace(string(ssh.MarshalAuthorizedKey(c.signer.PublicKey())))
+	return c.postSignedWithNonce(ctx, "/v1/auth/google", nonce, []string{pub, idToken},
+		map[string]any{"public_key": pub, "id_token": idToken}, nil)
 }
 
 // AssetDetail fetches the accounts and Koko-compatible protocols available
@@ -197,13 +203,36 @@ func (c *Client) Describe(ctx context.Context, key string) (jmsd.HostInfo, error
 
 // Connect mints a connection ticket for one asset+account+protocol
 // (POST /v1/connections). The signature binds asset|account|protocol, in
-// that order, matching jmsd.Server.handleConnections exactly -- like
-// VerifyMFA binding code, this stops a signature captured from a read call
+// that order, matching jmsd.Server.handleConnections exactly -- this stops a signature captured from a read call
 // being replayed here against an attacker-chosen asset.
-func (c *Client) Connect(ctx context.Context, assetID, account, protocol string) (jmsd.ConnectionTicket, error) {
+//
+// command is the remote command the ticket is minted for ("" for an
+// interactive session). It goes to jmsd's audit, signed in with the rest so
+// it cannot be swapped in transit -- though a ticket is not bound to it, so
+// this is a record of what jms said it would run, not a restriction.
+func (c *Client) Connect(ctx context.Context, assetID, account, protocol, command string) (jmsd.ConnectionTicket, error) {
+	extra := []string{assetID, account, protocol}
+	fields := map[string]any{"asset": assetID, "account": account, "protocol": protocol}
+	if command != "" {
+		extra = append(extra, command)
+		fields["command"] = command
+	}
 	var out jmsd.ConnectionTicket
-	err := c.postSigned(ctx, "/v1/connections", []string{assetID, account, protocol}, map[string]any{
-		"asset": assetID, "account": account, "protocol": protocol,
+	err := c.postSigned(ctx, "/v1/connections", extra, fields, &out)
+	return out, err
+}
+
+// Query runs one read-only SQL statement through jmsd (POST /v1/query). A
+// database-side failure comes back as QueryResult.Error, not as err.
+//
+// Its own HTTP timeout: jmsd lets a query run 30s, past the 15s every other
+// call is held to.
+func (c *Client) Query(ctx context.Context, assetID, account, protocol, sql string) (jmsd.QueryResult, error) {
+	slow := *c
+	slow.httpClient = &http.Client{Timeout: 45 * time.Second}
+	var out jmsd.QueryResult
+	err := slow.postSigned(ctx, "/v1/query", []string{assetID, account, protocol, sql}, map[string]any{
+		"asset": assetID, "account": account, "protocol": protocol, "sql": sql,
 	}, &out)
 	return out, err
 }
@@ -212,11 +241,24 @@ func (c *Client) Connect(ctx context.Context, assetID, account, protocol string)
 // fp/ts/nonce/sig plus fields, decoding a 200 response into out (out may be
 // nil when the caller only cares whether the call succeeded).
 func (c *Client) postSigned(ctx context.Context, path string, extra []string, fields map[string]any, out any) error {
-	ts, nonce, sig, err := c.sign(extra...)
+	nonce, err := NewNonce()
+	if err != nil {
+		return err
+	}
+	return c.postSignedWithNonce(ctx, path, nonce, extra, fields, out)
+}
+
+// postSignedWithNonce is postSigned for the one caller that has to fix the
+// nonce in advance: the Google sign-in, which embeds it in the ID token.
+func (c *Client) postSignedWithNonce(ctx context.Context, path, nonce string, extra []string, fields map[string]any, out any) error {
+	ts, sig, err := c.signWith(nonce, extra...)
 	if err != nil {
 		return err
 	}
 	body := map[string]any{"fp": c.fingerprint, "ts": ts, "nonce": nonce, "sig": sig}
+	if c.OnBehalfOf != "" {
+		body["on_behalf_of"] = c.OnBehalfOf
+	}
 	maps.Copy(body, fields)
 	data, err := json.Marshal(body)
 	if err != nil {
@@ -247,6 +289,9 @@ func (c *Client) getSigned(ctx context.Context, path string, extraQuery url.Valu
 	q.Set("ts", ts)
 	q.Set("nonce", nonce)
 	q.Set("sig", sig)
+	if c.OnBehalfOf != "" {
+		q.Set("on_behalf_of", c.OnBehalfOf)
+	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.baseURL+path+"?"+q.Encode(), nil)
 	if err != nil {
@@ -270,7 +315,7 @@ func (c *Client) do(req *http.Request, path string, out any) error {
 	if err != nil {
 		jmslog.Printf("%s %s: FAILED after %s: %v", req.Method, path,
 			time.Since(started).Round(time.Millisecond), err)
-		return err
+		return transportError(c.baseURL, path, c.httpClient.Timeout, err)
 	}
 	defer resp.Body.Close()
 	// Only the ones that went wrong. Every browse issues several of these, so
@@ -286,11 +331,10 @@ func (c *Client) do(req *http.Request, path string, out any) error {
 		data, _ := io.ReadAll(resp.Body)
 		if resp.StatusCode == http.StatusUnauthorized {
 			var body struct {
-				MFARequired bool   `json:"mfa_required"`
-				Username    string `json:"username"`
+				MFARequired bool `json:"mfa_required"`
 			}
 			if json.Unmarshal(data, &body) == nil && body.MFARequired {
-				return &MFARequiredError{Username: body.Username}
+				return &MFARequiredError{}
 			}
 		}
 		return &StatusError{Code: resp.StatusCode, Path: path, Message: errorMessage(data)}
@@ -301,26 +345,63 @@ func (c *Client) do(req *http.Request, path string, out any) error {
 	return json.NewDecoder(resp.Body).Decode(out)
 }
 
+// transportError turns a net/http failure into something worth reading.
+//
+// The error http.Client returns embeds the full request URL, and these URLs
+// carry a signature roughly a thousand characters long in the query string.
+// Printed as-is it buried the actual reason -- a timeout, a refused connection
+// -- past a screenful of base64, and the caller wrapping it as "resolve
+// identity" then pointed at the wrong thing entirely: nothing was wrong with
+// the identity, jmsd was simply unreachable.
+//
+// The address is kept, since a wrong jmsd_addr looks exactly like an outage and
+// is the first thing worth checking. The query string is dropped for the same
+// reason the log line above omits it.
+func transportError(baseURL, path string, timeout time.Duration, err error) error {
+	// url.Error's own message is the part carrying the signature; its wrapped
+	// Err is the part that explains the failure.
+	reason := err.Error()
+	var urlErr *url.Error
+	if errors.As(err, &urlErr) {
+		reason = urlErr.Err.Error()
+		if urlErr.Timeout() {
+			return fmt.Errorf("jmsd at %s did not answer within %s: %s",
+				baseURL, timeout, reason)
+		}
+	}
+	return fmt.Errorf("cannot reach jmsd at %s%s: %s", baseURL, path, reason)
+}
+
 // sign builds a fresh timestamp+nonce and signs
 // "fingerprint|ts|nonce[|extra...]" with c.signer, matching
 // internal/jmsd.Server.verifySignedRequest's payload construction exactly.
 func (c *Client) sign(extra ...string) (ts, nonce, sig string, err error) {
-	ts = strconv.FormatInt(time.Now().Unix(), 10)
-	nonce, err = randomNonce()
+	nonce, err = NewNonce()
 	if err != nil {
 		return "", "", "", err
 	}
-	payload := strings.Join(append([]string{c.fingerprint, ts, nonce}, extra...), "|")
-
-	signature, err := c.signer.Sign(rand.Reader, []byte(payload))
-	if err != nil {
-		return "", "", "", fmt.Errorf("sign request: %w", err)
-	}
-	sig = base64.StdEncoding.EncodeToString(ssh.Marshal(signature))
-	return ts, nonce, sig, nil
+	ts, sig, err = c.signWith(nonce, extra...)
+	return ts, nonce, sig, err
 }
 
-func randomNonce() (string, error) {
+func (c *Client) signWith(nonce string, extra ...string) (ts, sig string, err error) {
+	ts = strconv.FormatInt(time.Now().Unix(), 10)
+	if c.OnBehalfOf != "" {
+		// Last, and only when set: requests without it sign exactly what
+		// they always did, so older jmsd and jms keep agreeing.
+		extra = append(slices.Clip(extra), jmsd.OnBehalfPrefix+c.OnBehalfOf)
+	}
+	payload := strings.Join(append([]string{c.fingerprint, ts, nonce}, extra...), "|")
+	signature, err := c.signer.Sign(rand.Reader, []byte(payload))
+	if err != nil {
+		return "", "", fmt.Errorf("sign request: %w", err)
+	}
+	return ts, base64.StdEncoding.EncodeToString(ssh.Marshal(signature)), nil
+}
+
+// NewNonce returns a fresh request nonce. Exported for the Google sign-in,
+// which has to know the nonce before the request exists (see VerifyGoogle).
+func NewNonce() (string, error) {
 	buf := make([]byte, 16)
 	if _, err := rand.Read(buf); err != nil {
 		return "", err

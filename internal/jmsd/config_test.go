@@ -10,7 +10,7 @@ const minimalConfig = `core_host: "https://jumpserver.example.com"
 access_key_id: "ak"
 access_key_secret: "sk"
 core_db_dsn: "postgres://user:pass@host:5432/jumpserver?sslmode=disable"
-secret_key: "secret"
+google: {client_id: "c", hosted_domain: "example.com"}
 `
 
 func writeConfig(t *testing.T, body string) string {

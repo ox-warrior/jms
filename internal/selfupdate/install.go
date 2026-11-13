@@ -47,8 +47,7 @@ var ErrNotWritable = errors.New("install directory is not writable")
 // gets a chance to reject it.
 const maxBinarySize = 256 << 20
 
-// Check reports the published release when it is newer than this build and the
-// user has not skipped it. A nil Release with a nil error is the ordinary "you
+// Check reports the published release when it is newer than this build. A nil Release with a nil error is the ordinary "you
 // are up to date" answer.
 //
 // ctx carries the deadline. The caller is expected to keep it short: this runs
@@ -82,12 +81,6 @@ func Check(ctx context.Context, baseURL, localVersion string) (*Release, error) 
 	if m.Version == os.Getenv(envUpdatedTo) {
 		return nil, fmt.Errorf("%w: installed %s, still reporting %s",
 			ErrAlreadyUpdated, m.Version, localVersion)
-	}
-	// Checked after the comparison, not before: the file records one declined
-	// version, so it can only be consulted meaningfully once we know which
-	// version is on offer.
-	if m.Version == skippedVersion() {
-		return nil, nil
 	}
 	release, err := m.release(baseURL)
 	if err != nil {

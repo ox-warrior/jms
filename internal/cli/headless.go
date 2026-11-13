@@ -8,18 +8,19 @@
 //
 // What differs here is only where a human would otherwise be asked something:
 // which asset a name means (exact match or refuse, never guess), which account
-// to use (see resolveAccount), and how an MFA code is collected (a tty read,
-// not a modal).
+// to use (see resolveAccount), and how sign-in is announced (stderr, not a
+// modal).
 package cli
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
 	"os"
+	"slices"
 	"strings"
-
-	"golang.org/x/term"
+	"time"
 
 	"github.com/leiyupeng/jumpserver-cli/internal/config"
 	"github.com/leiyupeng/jumpserver-cli/internal/connectflow"
@@ -36,7 +37,17 @@ type headlessTarget struct {
 	Kind    jmsd.ResourceKind
 	Name    string
 	Account string
+	// Command is what followed "--". Non-empty runs it instead of opening a
+	// shell, and makes the whole run non-interactive (see signIn).
+	Command string
+	// Timeout bounds Command; 0 means none.
+	Timeout time.Duration
 }
+
+// maxCommandOutput caps what one remote command may print, stdout and stderr
+// together. Enough for any log excerpt worth reading; small enough that an
+// unbounded cat cannot flood Koko or an AI's context.
+const maxCommandOutput = 1 << 20
 
 // headlessDeps is everything runHeadless needs that isn't specific to one
 // asset.
@@ -44,7 +55,74 @@ type headlessDeps struct {
 	Endpoints config.Endpoints
 	JmsdAddr  string
 	Identity  string
-	K9sPath   string
+	// OnBehalfOf: see jmsdclient.Client.OnBehalfOf.
+	OnBehalfOf string
+	K9sPath    string
+	CacheTTL   time.Duration
+}
+
+// errMFANeedsLogin is what a run that cannot prompt reports when MFA has
+// lapsed. It names the fix rather than the condition: the caller is usually
+// an AI agent or a script, and the only thing either can do is hand this
+// sentence to a human.
+var errMFANeedsLogin = errors.New("not signed in, or the 10-day sign-in has lapsed, and this run does not prompt -- " +
+	"ask a human to run `jms login`, then retry")
+
+// errUnregisteredKey is what an explicit -i key gets instead of a sign-in.
+// Such a key is a service key: jmsd knows it from service_keys or not at all.
+// Signing it in with Google would bind it to whoever clicked through -- the
+// agent would then act, and be audited, as that person.
+var errUnregisteredKey = errors.New("this -i key is not in jmsd's service_keys -- " +
+	"ask the jmsd admin to register its public key; `jms login` does not apply to -i keys")
+
+// signIn resolves which JumpServer user this key belongs to, and returns the
+// gate every later jmsd call should go through.
+//
+// interactive decides what a lapsed sign-in does: open the browser, or fail
+// with errMFANeedsLogin. An agent such as Claude Code cannot click through a
+// browser, so a sign-in there would hang until the tool call times out rather
+// than fail.
+func signIn(ctx context.Context, identityPath, onBehalfOf, jmsdAddr string, interactive bool) (*connectflow.Gate, jmsdclient.Identity, error) {
+	signer, _, err := sshclient.LoadIdentity(identityPath)
+	if err != nil {
+		return nil, jmsdclient.Identity{}, resolveErr(err)
+	}
+	jc := jmsdclient.New(jmsdAddr, signer)
+	jc.OnBehalfOf = onBehalfOf
+	gate := newGate(ctx, jc, identityPath != "", interactive)
+
+	identity, err := connectflow.WithMFA(gate, func() (jmsdclient.Identity, error) { return jc.Whoami(ctx) })
+	if err != nil {
+		return nil, identity, resolveErr(fmt.Errorf("resolve identity: %w", err))
+	}
+	// Known from here on, so later prompts show a name instead of falling
+	// back to whatever MFARequiredError happens to carry -- same as the TUI
+	// re-building its gate with a username once identify() learns one.
+	gate.Username = identity.Username
+	return gate, identity, nil
+}
+
+// newGate builds the gate for a terminal run. A service key (-i) never signs
+// in; otherwise interactive signs in through the browser, and a run that
+// cannot prompt fails with errMFANeedsLogin.
+func newGate(ctx context.Context, jc *jmsdclient.Client, serviceKey, interactive bool) *connectflow.Gate {
+	gate := &connectflow.Gate{JC: jc, Ctx: ctx}
+	gate.Authenticate = func(context.Context, string) error { return errMFANeedsLogin }
+	switch {
+	case serviceKey:
+		gate.Authenticate = func(context.Context, string) error { return errUnregisteredKey }
+	case interactive:
+		gate.Authenticate = func(ctx context.Context, _ string) error {
+			if googleClientID == "" {
+				return errNoGoogleClient
+			}
+			return connectflow.GoogleSignIn(ctx, jc, googleClient(), func(url string) {
+				fmt.Fprintf(os.Stderr, "jms: sign in to Google in the browser that just opened (needed every 10 days).\n"+
+					"     If none opened, visit:\n     %s\n", url)
+			})
+		}
+	}
+	return gate
 }
 
 // runHeadless resolves target to exactly one asset+account+protocol,
@@ -56,29 +134,26 @@ func runHeadless(ctx context.Context, target headlessTarget, deps headlessDeps) 
 	if err != nil {
 		return resolveErr(err)
 	}
-	signer, _, err := sshclient.LoadIdentity(deps.Identity)
+	runCommand := target.Command != ""
+	gate, identity, err := signIn(ctx, deps.Identity, deps.OnBehalfOf, deps.JmsdAddr, !runCommand)
+	if err != nil {
+		return err
+	}
+	jmslog.Printf("-c %s %s: signed in as %s", target.Kind, target.Name, identity.Username)
+
+	assets, cached, err := loadAssets(gate, deps.JmsdAddr, identity.Username, deps.CacheTTL, false)
 	if err != nil {
 		return resolveErr(err)
 	}
-	jc := jmsdclient.New(deps.JmsdAddr, signer)
-
-	gate := &connectflow.Gate{JC: jc, Ctx: ctx, Prompt: promptTOTPFromTTY}
-
-	identity, err := connectflow.WithMFA(gate, func() (jmsdclient.Identity, error) { return jc.Whoami(ctx) })
-	if err != nil {
-		return resolveErr(fmt.Errorf("resolve identity: %w", err))
-	}
-	// Known from here on, so later prompts show a name instead of falling
-	// back to whatever MFARequiredError happens to carry -- same as the TUI
-	// re-building its gate with a username once identify() learns one.
-	gate.Username = identity.Username
-	jmslog.Printf("-c %s %s: signed in as %s", target.Kind, target.Name, identity.Username)
-
-	assets, err := connectflow.WithMFA(gate, func() ([]jmsd.AssetRow, error) { return jc.Assets(ctx) })
-	if err != nil {
-		return resolveErr(fmt.Errorf("load assets: %w", err))
-	}
 	asset, candidates, err := matchAsset(assets, target.Kind, target.Name)
+	// A cached listing predates any asset created since it was written, so
+	// "not found" from the cache is only worth believing once Core agrees.
+	if errors.Is(err, ErrAssetNotFound) && cached {
+		if assets, _, err = loadAssets(gate, deps.JmsdAddr, identity.Username, deps.CacheTTL, true); err != nil {
+			return resolveErr(err)
+		}
+		asset, candidates, err = matchAsset(assets, target.Kind, target.Name)
+	}
 	if err != nil {
 		return resolveErr(describeAssetMatchFailure(err, target, candidates))
 	}
@@ -101,8 +176,20 @@ func runHeadless(ctx context.Context, target headlessTarget, deps headlessDeps) 
 	if err != nil {
 		return resolveErr(err)
 	}
+	// Checked before the mint, not left to Koko: Koko answers a command on a
+	// non-ssh ticket by printing "not ssh asset connection token" to stdout
+	// and exiting 0, which a caller would take for the command's output.
+	isQuery := slices.Contains(jmsd.QueryProtocols, protocol.Name)
+	if runCommand && protocol.Name != "ssh" && !isQuery {
+		return resolveErr(fmt.Errorf("%s is reached over %s; running a command needs ssh or one of %s",
+			asset.Name, protocol.Name, strings.Join(jmsd.QueryProtocols, ", ")))
+	}
 
-	account, err := resolveAccount(asset.Name, detail.Accounts, target.Account, chooseAccountFromTTY)
+	choose := chooseAccountFromTTY
+	if runCommand {
+		choose = nil // ambiguity becomes "pass --account", never a prompt -- see signIn
+	}
+	account, err := resolveAccount(asset.Name, detail.Accounts, target.Account, choose)
 	if err != nil {
 		return resolveErr(err)
 	}
@@ -110,6 +197,10 @@ func runHeadless(ctx context.Context, target headlessTarget, deps headlessDeps) 
 	// below are the only local record of which identity the session ran as.
 	fmt.Fprintf(os.Stderr, "jms: connecting to %s as %s\n", asset.Name, describeAccount(account))
 	jmslog.Printf("-c %s: using account=%s (alias=%s) protocol=%s", asset.Name, account.Username, account.Alias, protocol.Name)
+
+	if runCommand && isQuery {
+		return runQuery(gate, asset, account, protocol.Name, target.Command)
+	}
 
 	isK8s := connectflow.IsK8sProtocol(protocol.Name)
 	var k8sPrep *connectflow.K8sPrep
@@ -119,7 +210,7 @@ func runHeadless(ctx context.Context, target headlessTarget, deps headlessDeps) 
 		}
 	}
 
-	ticket, err := connectflow.MintTicket(gate, asset.ID, asset.Name, account.Alias, protocol.Name)
+	ticket, err := connectflow.MintTicket(gate, asset.ID, asset.Name, account.Alias, protocol.Name, target.Command)
 	if err != nil {
 		return connectErr(err)
 	}
@@ -134,6 +225,25 @@ func runHeadless(ctx context.Context, target headlessTarget, deps headlessDeps) 
 	// nothing on this side records that a session ended, or when.
 	jmslog.Printf("-c %s: session open (account=%s protocol=%s ticket=%s)", asset.Name, account.Alias, protocol.Name, ticket.ID)
 	defer jmslog.Printf("-c %s: session closed (ticket=%s)", asset.Name, ticket.ID)
+
+	if runCommand {
+		// The command text is not logged: it can carry a password, and Koko
+		// already records it in Core's command log next to this ticket.
+		status, silent, err := sshclient.RunCommand(assetClient, target.Command, target.Timeout, maxCommandOutput)
+		if err != nil {
+			jmslog.Printf("-c %s: command error: %v", asset.Name, err)
+			return connectErr(err)
+		}
+		jmslog.Printf("-c %s: command exited %d (ticket=%s)", asset.Name, status, ticket.ID)
+		if status != 0 {
+			return remoteExit(status)
+		}
+		if silent {
+			fmt.Fprintln(os.Stderr, "jms: the command printed nothing; if output was expected, "+
+				"a JumpServer command-filter rule may have rejected it (Koko reports that as success)")
+		}
+		return nil
+	}
 
 	var sessionErr error
 	if isK8s {
@@ -170,30 +280,41 @@ func describeProtocols(options []jmsd.ProtocolOption) string {
 	return strings.Join(names, ", ")
 }
 
-// promptTOTPFromTTY asks for a TOTP code directly on the controlling
-// terminal, bypassing stdin/stdout so it works the same whether or not those
-// are redirected. Unix only (/dev/tty) -- jms has no Windows build target
-// today.
-//
-// There is deliberately no --totp flag: a code is only valid for the ~30
-// seconds around when it was generated, so one written into a command line
-// would need to be typed and run within that window anyway, while also
-// landing in shell history -- worse on both counts than typing it here.
-func promptTOTPFromTTY(_ context.Context, username, errMsg string) (string, error) {
-	if errMsg != "" {
-		fmt.Fprintln(os.Stderr, "jms:", errMsg)
-	}
-	tty, err := os.OpenFile("/dev/tty", os.O_RDWR, 0)
+// runQuery is "-- command" for a mysql or redis asset: jmsd runs it (Koko
+// cannot) and the rows come back as tab-separated text -- `mysql -B` with its
+// header line, or one value per line for Redis -- so they pipe into cut/awk
+// like any other output.
+func runQuery(gate *connectflow.Gate, asset jmsd.AssetRow, account jmsd.AccountOption, protocol, query string) error {
+	res, err := connectflow.WithMFA(gate, func() (jmsd.QueryResult, error) {
+		return gate.JC.Query(gate.Ctx, asset.ID, account.Alias, protocol, query)
+	})
 	if err != nil {
-		return "", fmt.Errorf("open terminal for MFA prompt: %w", err)
+		return connectErr(err)
 	}
-	defer tty.Close()
-
-	fmt.Fprintf(tty, "%s · MFA code: ", username)
-	code, err := term.ReadPassword(int(tty.Fd()))
-	fmt.Fprintln(tty)
-	if err != nil {
-		return "", fmt.Errorf("read MFA code: %w", err)
+	if res.Error != "" {
+		fmt.Fprintln(os.Stderr, "ERROR:", res.Error)
+		return remoteExit(1) // what the mysql client exits with
 	}
-	return strings.TrimSpace(string(code)), nil
+	w := bufio.NewWriter(os.Stdout)
+	defer w.Flush()
+	if len(res.Columns) > 0 { // Redis replies have none: one value per line, as redis-cli --raw
+		fmt.Fprintln(w, strings.Join(res.Columns, "\t"))
+	}
+	for _, row := range res.Rows {
+		cells := make([]string, len(row))
+		for i, v := range row {
+			cells[i] = "NULL"
+			if v != nil {
+				cells[i] = tsvEscaper.Replace(*v)
+			}
+		}
+		fmt.Fprintln(w, strings.Join(cells, "\t"))
+	}
+	if res.Truncated {
+		fmt.Fprintf(os.Stderr, "jms: result truncated at %d rows; add a LIMIT or narrow the WHERE\n", len(res.Rows))
+	}
+	return nil
 }
+
+// tsvEscaper keeps one row per line and one cell per tab, as mysql -B does.
+var tsvEscaper = strings.NewReplacer("\\", "\\\\", "\t", "\\t", "\n", "\\n")

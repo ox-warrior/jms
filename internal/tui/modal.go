@@ -118,40 +118,47 @@ func pickFrom[T any](u *UI, ctx context.Context, title string, options []T, labe
 	return options[index], nil
 }
 
-// promptOTP asks for a TOTP code. It isn't tied to a login attemptID, since
-// it can fire any time after login whenever jmsd reports MFA has lapsed.
-func (u *UI) promptOTP(ctx context.Context, username, errMsg string) (string, error) {
-	// The hint line doubles as the error slot, so it turns red when a
-	// previous attempt failed.
-	hintText, hintColor := "Enter to submit · Esc to cancel", theme.Muted
-	if errMsg != "" {
-		hintText, hintColor = errMsg+" · "+hintText, theme.Danger
-	}
-	return modalPrompt(u, ctx, promptSpec{
-		pageName:  "mfa-prompt",
-		width:     76,
-		height:    5,
-		title:     username + " · MFA required (every 10 days)",
-		hint:      hintText,
-		hintColor: hintColor,
-	}, func(finish func(string, error)) tview.Primitive {
-		field := tview.NewInputField().SetLabel("MFA code ")
-		field.SetLabelColor(theme.Accent).SetFieldBackgroundColor(theme.Bg).SetFieldTextColor(theme.Fg)
-		field.SetDoneFunc(func(key tcell.Key) {
-			if key == tcell.KeyEnter {
-				finish(field.GetText(), nil)
-			}
-		})
-		return field
-	})
+// gate builds a connectflow.Gate wired to this UI's sign-in modal. The retry
+// mechanics live in internal/connectflow, shared with the CLI's headless
+// connect path -- see that package's doc comment for why.
+func (u *UI) gate(ctx context.Context, jc *jmsdclient.Client, username string) *connectflow.Gate {
+	return &connectflow.Gate{JC: jc, Ctx: ctx, Username: username,
+		Authenticate: func(ctx context.Context, _ string) error { return u.googleSignIn(ctx, jc) }}
 }
 
-// gate builds a connectflow.Gate wired to this UI's modal prompt. The MFA
-// retry mechanics (withMFA/HandleMFA/the 401-vs-everything-else distinction)
-// live in internal/connectflow, shared with the CLI's headless connect path
-// -- see that package's doc comment for why they are not duplicated here.
-func (u *UI) gate(ctx context.Context, jc *jmsdclient.Client, username string) *connectflow.Gate {
-	return &connectflow.Gate{JC: jc, Ctx: ctx, Username: username, Prompt: u.promptOTP}
+// errNoGoogleClient is what a build without an injected client ID reports
+// instead of a sign-in it cannot run.
+var errNoGoogleClient = errors.New("this jms was built without a Google client ID and cannot sign in -- build it with make")
+
+// googleSignIn shows a waiting modal while the browser sign-in runs, with Esc
+// to give up. Cancelling the context on the way out is what stops the
+// sign-in still waiting behind a modal the user has already closed.
+func (u *UI) googleSignIn(ctx context.Context, jc *jmsdclient.Client) error {
+	if u.opts.Google.ID == "" {
+		return errNoGoogleClient
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	_, err := modalPrompt(u, ctx, promptSpec{
+		pageName:  "google-signin",
+		width:     76,
+		height:    5,
+		title:     "Google sign-in (every 10 days)",
+		hint:      "Esc to cancel",
+		hintColor: theme.Muted,
+	}, func(finish func(struct{}, error)) tview.Primitive {
+		go func() {
+			// The URL is not shown here: it is several hundred characters,
+			// and on a laptop the browser opens anyway.
+			finish(struct{}{}, connectflow.GoogleSignIn(ctx, jc, u.opts.Google, func(string) {}))
+		}()
+		return tview.NewTextView().SetTextAlign(tview.AlignCenter).
+			SetText("Finish the Google sign-in in your browser…")
+	})
+	if errors.Is(err, errPromptCancelled) {
+		return connectflow.ErrCancelled
+	}
+	return err
 }
 
 // showConnecting displays a small modal indicating a connect attempt is in

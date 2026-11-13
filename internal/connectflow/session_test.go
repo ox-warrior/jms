@@ -128,7 +128,7 @@ func TestMintTicketWrapsTheUnderlyingError(t *testing.T) {
 		w.WriteHeader(http.StatusBadGateway)
 		_, _ = w.Write([]byte(`{"error":"core rejected the request"}`))
 	}
-	_, err := MintTicket(&Gate{JC: jc, Ctx: context.Background()}, "asset-1", "db-1", "root", "ssh")
+	_, err := MintTicket(&Gate{JC: jc, Ctx: context.Background()}, "asset-1", "db-1", "root", "ssh", "")
 	if err == nil || !strings.HasPrefix(err.Error(), "mint connection ticket failed: ") {
 		t.Errorf("MintTicket() error = %v, want it prefixed \"mint connection ticket failed: \"", err)
 	}
@@ -137,7 +137,7 @@ func TestMintTicketWrapsTheUnderlyingError(t *testing.T) {
 func TestMintTicketSucceeds(t *testing.T) {
 	f, jc := newFakeJmsd(t)
 	f.connections = jsonOK(`{"id":"ticket-1","value":"secret","expire_time":300,"account_name":"root","protocol":"ssh"}`)
-	ticket, err := MintTicket(&Gate{JC: jc, Ctx: context.Background()}, "asset-1", "db-1", "root", "ssh")
+	ticket, err := MintTicket(&Gate{JC: jc, Ctx: context.Background()}, "asset-1", "db-1", "root", "ssh", "")
 	if err != nil {
 		t.Fatalf("MintTicket() error = %v, want nil", err)
 	}

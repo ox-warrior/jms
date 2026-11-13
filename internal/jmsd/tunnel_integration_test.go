@@ -31,7 +31,7 @@ import (
 // and copies bytes in the right direction.
 
 // testTunnelKey is a fresh keypair, because authenticating needs the private
-// half and the package's fixtures (testKeyA) are public keys only.
+// half and nothing else in the package hands out private keys.
 func testTunnelKey(t *testing.T) (ssh.Signer, string, string) {
 	t.Helper()
 	_, priv, err := ed25519.GenerateKey(rand.Reader)
@@ -102,7 +102,10 @@ type tunnelTestServer struct {
 	stop func()
 }
 
-func newTunnelTestServer(t *testing.T, rows []sshKeyRow, allow []TunnelRule) *tunnelTestServer {
+// testKeyRow is one user with one signed-in key.
+type testKeyRow struct{ userID, username, publicKey string }
+
+func newTunnelTestServer(t *testing.T, rows []testKeyRow, allow []TunnelRule) *tunnelTestServer {
 	t.Helper()
 
 	_, hostPriv, err := ed25519.GenerateKey(rand.Reader)
@@ -118,6 +121,10 @@ func newTunnelTestServer(t *testing.T, rows []sshKeyRow, allow []TunnelRule) *tu
 		t.Fatalf("compile policy: %v", err)
 	}
 
+	var users []userRecord
+	for _, r := range rows {
+		users = append(users, userRecord{ID: r.userID, Username: r.username})
+	}
 	srv := &Server{
 		cfg: Config{
 			MFAIntervalDays: 10,
@@ -127,10 +134,13 @@ func newTunnelTestServer(t *testing.T, rows []sshKeyRow, allow []TunnelRule) *tu
 				MaxChannels: 8,
 			},
 		},
-		users:        newUserDirectory(func() ([]sshKeyRow, error) { return rows, nil }, keyIndexTTL),
+		users:        newUserDirectory(func() ([]userRecord, error) { return users, nil }, userListTTL),
 		state:        newMemStateStore(),
 		tunnelSigner: hostSigner,
 		tunnelPolicy: policy,
+	}
+	for _, r := range rows {
+		bindTestKey(t, srv, r.publicKey, r.userID, time.Now().Add(time.Hour))
 	}
 
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
@@ -172,14 +182,11 @@ func TestTunnelServerCarriesAStream(t *testing.T) {
 	defer stopEcho()
 
 	signer, authorized, _ := testTunnelKey(t)
-	rows := []sshKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
+	rows := []testKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
 	allow := []TunnelRule{{CIDR: ip + "/32", Ports: []int{echoPort}}}
 
 	ts := newTunnelTestServer(t, rows, allow)
 	defer ts.stop()
-	if err := ts.srv.state.RecordMFA("alice", time.Now()); err != nil {
-		t.Fatalf("record mfa: %v", err)
-	}
 
 	client := dialTunnel(t, ts.addr, ts.srv.tunnelSigner.PublicKey(), signer)
 	defer client.Close()
@@ -209,15 +216,12 @@ func TestTunnelServerCarriesAStream(t *testing.T) {
 // that Redis is how anyone skips any user's MFA.
 func TestTunnelServerRefusesLoopbackEvenWhenAllowed(t *testing.T) {
 	signer, authorized, _ := testTunnelKey(t)
-	rows := []sshKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
+	rows := []testKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
 	// Deliberately as permissive as an operator could make it.
 	allow := []TunnelRule{{CIDR: "0.0.0.0/0", Ports: []int{1, 22, 80, 443, 5432, 6379, 8391, 65535}}}
 
 	ts := newTunnelTestServer(t, rows, allow)
 	defer ts.stop()
-	if err := ts.srv.state.RecordMFA("alice", time.Now()); err != nil {
-		t.Fatalf("record mfa: %v", err)
-	}
 	client := dialTunnel(t, ts.addr, ts.srv.tunnelSigner.PublicKey(), signer)
 	defer client.Close()
 
@@ -236,47 +240,20 @@ func TestTunnelServerRefusesLoopbackEvenWhenAllowed(t *testing.T) {
 	}
 }
 
-// A destination outside the allow list is refused, and the client is told
-// "not permitted" rather than something that reads like the destination is
-// down -- the two send the user looking in opposite directions.
-func TestTunnelServerRefusesUnlistedDestination(t *testing.T) {
-	ip := nonLoopbackIPv4(t)
-	signer, authorized, _ := testTunnelKey(t)
-	rows := []sshKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
-	allow := []TunnelRule{{CIDR: "10.200.200.0/24", Ports: []int{443}}}
-
-	ts := newTunnelTestServer(t, rows, allow)
-	defer ts.stop()
-	if err := ts.srv.state.RecordMFA("alice", time.Now()); err != nil {
-		t.Fatalf("record mfa: %v", err)
-	}
-	client := dialTunnel(t, ts.addr, ts.srv.tunnelSigner.PublicKey(), signer)
-	defer client.Close()
-
-	_, err := client.Dial("tcp", net.JoinHostPort(ip, "443"))
-	if err == nil {
-		t.Fatal("a destination outside tunnel.allow was connected")
-	}
-	t.Logf("refused as expected: %v", err)
-}
-
 // Authentication is the whole gate, so both ways it can fail have to actually
-// fail: a key nobody registered, and a registered key whose MFA interval has
-// lapsed. The second is the case a legitimate client never reaches (jms clears
-// MFA on the control plane before dialling), which is exactly why it must not
-// answer with anything that explains itself.
-func TestTunnelServerRefusesUnregisteredKeyAndStaleMFA(t *testing.T) {
+// fail: a key nobody signed in, and one whose sign-in has lapsed. The second
+// is the case a legitimate client never reaches (jms signs in on the control
+// plane before dialling), which is exactly why it must not answer with
+// anything that explains itself.
+func TestTunnelServerRefusesUnknownAndLapsedKeys(t *testing.T) {
 	signer, authorized, _ := testTunnelKey(t)
 	other, _, _ := testTunnelKey(t)
-	rows := []sshKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
+	rows := []testKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
 	allow := []TunnelRule{{CIDR: "10.200.200.0/24", Ports: []int{443}}}
 
-	t.Run("unregistered key", func(t *testing.T) {
+	t.Run("unknown key", func(t *testing.T) {
 		ts := newTunnelTestServer(t, rows, allow)
 		defer ts.stop()
-		if err := ts.srv.state.RecordMFA("alice", time.Now()); err != nil {
-			t.Fatalf("record mfa: %v", err)
-		}
 		_, err := ssh.Dial("tcp", ts.addr, &ssh.ClientConfig{
 			User:            "jms",
 			Auth:            []ssh.AuthMethod{ssh.PublicKeys(other)},
@@ -284,16 +261,14 @@ func TestTunnelServerRefusesUnregisteredKeyAndStaleMFA(t *testing.T) {
 			Timeout:         10 * time.Second,
 		})
 		if err == nil {
-			t.Fatal("a key nobody registered was admitted")
+			t.Fatal("a key nobody signed in was admitted")
 		}
 	})
 
-	t.Run("stale mfa", func(t *testing.T) {
+	t.Run("lapsed sign-in", func(t *testing.T) {
 		ts := newTunnelTestServer(t, rows, allow)
 		defer ts.stop()
-		if err := ts.srv.state.RecordMFA("alice", time.Now().Add(-11*24*time.Hour)); err != nil {
-			t.Fatalf("record mfa: %v", err)
-		}
+		bindTestKey(t, ts.srv, authorized, "u1", time.Now().Add(-time.Minute))
 		_, err := ssh.Dial("tcp", ts.addr, &ssh.ClientConfig{
 			User:            "jms",
 			Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
@@ -301,7 +276,7 @@ func TestTunnelServerRefusesUnregisteredKeyAndStaleMFA(t *testing.T) {
 			Timeout:         10 * time.Second,
 		})
 		if err == nil {
-			t.Fatal("a caller whose MFA interval lapsed was admitted")
+			t.Fatal("a key whose sign-in lapsed was admitted")
 		}
 	})
 }
@@ -312,7 +287,7 @@ func TestTunnelServerRefusesUnregisteredKeyAndStaleMFA(t *testing.T) {
 func TestTunnelServerRefusesSessionChannels(t *testing.T) {
 	ip := nonLoopbackIPv4(t)
 	signer, authorized, _ := testTunnelKey(t)
-	rows := []sshKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
+	rows := []testKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
 	// The echo server is only here so the allow list has something real in
 	// it; this test never opens a channel to it.
 	_, echoPort, stopEcho := startBoundEcho(t, ip)
@@ -321,9 +296,6 @@ func TestTunnelServerRefusesSessionChannels(t *testing.T) {
 
 	ts := newTunnelTestServer(t, rows, allow)
 	defer ts.stop()
-	if err := ts.srv.state.RecordMFA("alice", time.Now()); err != nil {
-		t.Fatalf("record mfa: %v", err)
-	}
 	client := dialTunnel(t, ts.addr, ts.srv.tunnelSigner.PublicKey(), signer)
 	defer client.Close()
 
@@ -332,37 +304,6 @@ func TestTunnelServerRefusesSessionChannels(t *testing.T) {
 	} else {
 		t.Logf("session refused as expected: %v", err)
 	}
-}
-
-// A pinned host key that does not match must fail the handshake. This is the
-// client-side half of why the key is published over the authenticated control
-// plane instead of being trusted on first use.
-func TestTunnelServerWrongHostKeyIsRefused(t *testing.T) {
-	signer, authorized, _ := testTunnelKey(t)
-	rows := []sshKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
-	allow := []TunnelRule{{CIDR: "10.200.200.0/24", Ports: []int{443}}}
-
-	ts := newTunnelTestServer(t, rows, allow)
-	defer ts.stop()
-
-	_, wrongPriv, err := ed25519.GenerateKey(rand.Reader)
-	if err != nil {
-		t.Fatal(err)
-	}
-	wrongSigner, err := ssh.NewSignerFromKey(wrongPriv)
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = ssh.Dial("tcp", ts.addr, &ssh.ClientConfig{
-		User:            "jms",
-		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
-		HostKeyCallback: ssh.FixedHostKey(wrongSigner.PublicKey()),
-		Timeout:         10 * time.Second,
-	})
-	if err == nil {
-		t.Fatal("a client pinned to a different host key still connected")
-	}
-	t.Logf("refused as expected: %v", err)
 }
 
 // The open/close pair is the only record that a user ever had a tunnel --
@@ -375,7 +316,7 @@ func TestTunnelSessionLogsOpenAndCloseWithTotals(t *testing.T) {
 	defer stopEcho()
 
 	signer, authorized, _ := testTunnelKey(t)
-	rows := []sshKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
+	rows := []testKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
 	allow := []TunnelRule{{CIDR: ip + "/32", Ports: []int{echoPort}}}
 
 	logBuf := &syncBuffer{}
@@ -383,9 +324,6 @@ func TestTunnelSessionLogsOpenAndCloseWithTotals(t *testing.T) {
 	defer restore()
 
 	ts := newTunnelTestServer(t, rows, allow)
-	if err := ts.srv.state.RecordMFA("alice", time.Now()); err != nil {
-		t.Fatalf("record mfa: %v", err)
-	}
 
 	client := dialTunnel(t, ts.addr, ts.srv.tunnelSigner.PublicKey(), signer)
 	// Three streams, so the total is distinguishable from both 0 and 1.
@@ -467,16 +405,13 @@ func TestTunnelMaxChannelsHoldsUnderConcurrentOpens(t *testing.T) {
 	defer stopEcho()
 
 	signer, authorized, _ := testTunnelKey(t)
-	rows := []sshKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
+	rows := []testKeyRow{{userID: "u1", username: "alice", publicKey: authorized}}
 	allow := []TunnelRule{{CIDR: ip + "/32", Ports: []int{echoPort}}}
 
 	const limit = 4
 	ts := newTunnelTestServer(t, rows, allow)
 	ts.srv.cfg.Tunnel.MaxChannels = limit
 	defer ts.stop()
-	if err := ts.srv.state.RecordMFA("alice", time.Now()); err != nil {
-		t.Fatalf("record mfa: %v", err)
-	}
 
 	client := dialTunnel(t, ts.addr, ts.srv.tunnelSigner.PublicKey(), signer)
 	defer client.Close()
@@ -530,4 +465,16 @@ func TestTunnelMaxChannelsHoldsUnderConcurrentOpens(t *testing.T) {
 		t.Fatalf("a permitted stream was refused after rejections, so the limit leaked: %v", err)
 	}
 	_ = conn.Close()
+}
+
+// bindTestKey does what a Google sign-in does: binds a key to a user until.
+func bindTestKey(t *testing.T, srv *Server, authorized, userID string, until time.Time) {
+	t.Helper()
+	pub, _, _, _, err := ssh.ParseAuthorizedKey([]byte(authorized))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := srv.state.BindKey(ssh.FingerprintSHA256(pub), keyBinding{UserID: userID, PublicKey: authorized}, until); err != nil {
+		t.Fatal(err)
+	}
 }

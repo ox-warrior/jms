@@ -46,7 +46,7 @@ type manifestTarget struct {
 }
 
 // errNoTarget means the manifest is fine and simply does not cover this
-// machine -- a Linux arm64 laptop, say. Distinguished from a parse failure
+// machine -- a Windows machine, say. Distinguished from a parse failure
 // only so the log line says which of the two happened.
 var errNoTarget = errors.New("no published build for this platform")
 
@@ -66,6 +66,8 @@ func targetDir() (string, error) {
 		return "amd", nil
 	case runtime.GOOS == "linux" && runtime.GOARCH == "amd64":
 		return "linux", nil
+	case runtime.GOOS == "linux" && runtime.GOARCH == "arm64":
+		return "linux-arm64", nil
 	}
 	return "", fmt.Errorf("%w: %s/%s", errNoTarget, runtime.GOOS, runtime.GOARCH)
 }

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"strings"
 	"testing"
 )
@@ -132,5 +133,31 @@ func TestValidateTunnelFlags(t *testing.T) {
 					tc.port, tc.command, err, tc.wantErr)
 			}
 		})
+	}
+}
+
+// "ls" is both a subcommand and the most likely remote command. After "--" it
+// must reach the asset, not list jms's own inventory.
+func TestRemoteCommandIsNotASubcommand(t *testing.T) {
+	root := newRootCommand()
+	got, _, err := root.Find([]string{"-c", "ec2 ng0", "--", "ls", "-la"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got != root {
+		t.Fatalf("\"-- ls\" resolved to %q, want the root command", got.Name())
+	}
+}
+
+// Scripts and agents branch on the exit code: a jms-side failure has to be
+// 255, and a remote command's own status must come through untouched even
+// when it collides with jms's 2/3.
+func TestCommandModeExitCodes(t *testing.T) {
+	var exitErr *ExitError
+	if !errors.As(asCommandFailure(connectErr(errors.New("dial"))), &exitErr) || exitErr.Code != ExitCommandFailed {
+		t.Errorf("jms-side failure: got %v, want code %d", exitErr, ExitCommandFailed)
+	}
+	if !errors.As(asCommandFailure(remoteExit(2)), &exitErr) || exitErr.Code != 2 {
+		t.Errorf("remote status 2: got %v, want it passed through", exitErr)
 	}
 }

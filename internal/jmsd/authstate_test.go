@@ -51,68 +51,37 @@ func stateStoreSuite(t *testing.T, newStore func(t *testing.T) StateStore) {
 		}
 	})
 
-	t.Run("unknown user has never done MFA", func(t *testing.T) {
+	t.Run("unknown key is not bound", func(t *testing.T) {
 		s := newStore(t)
-		_, ok, err := s.LastMFA(uniqueKey("nobody"))
-		if err != nil {
-			t.Fatalf("LastMFA: %v", err)
-		}
-		if ok {
-			t.Fatal("a user who never verified was reported as having verified")
+		if _, ok, err := s.BoundKey(uniqueKey("fp")); err != nil || ok {
+			t.Fatalf("BoundKey on a fresh key: ok=%v err=%v", ok, err)
 		}
 	})
 
-	t.Run("MFA timestamp round-trips", func(t *testing.T) {
+	t.Run("binding round-trips and later sign-ins overwrite", func(t *testing.T) {
 		s := newStore(t)
-		user := uniqueKey("alice")
-		// Truncated to the second: the Redis backend stores a unix second
-		// count, so sub-second precision is not part of the contract.
-		want := time.Now().Add(-3 * time.Hour).Truncate(time.Second)
-		if err := s.RecordMFA(user, want); err != nil {
-			t.Fatalf("RecordMFA: %v", err)
-		}
-		got, ok, err := s.LastMFA(user)
-		if err != nil {
-			t.Fatalf("LastMFA: %v", err)
-		}
-		if !ok {
-			t.Fatal("LastMFA reported no record right after RecordMFA")
-		}
-		if !got.Equal(want) {
-			t.Fatalf("LastMFA = %v, want %v", got, want)
+		fp := uniqueKey("fp")
+		for _, user := range []string{"u1", "u2"} {
+			want := keyBinding{UserID: user, PublicKey: "ssh-ed25519 AAAA"}
+			if err := s.BindKey(fp, want, time.Now().Add(time.Hour)); err != nil {
+				t.Fatalf("BindKey: %v", err)
+			}
+			got, ok, err := s.BoundKey(fp)
+			if err != nil || !ok || got != want {
+				t.Fatalf("BoundKey = %+v ok=%v err=%v, want %+v", got, ok, err, want)
+			}
 		}
 	})
 
-	t.Run("RecordMFA overwrites", func(t *testing.T) {
+	t.Run("expired binding is gone", func(t *testing.T) {
 		s := newStore(t)
-		user := uniqueKey("bob")
-		older := time.Now().Add(-20 * 24 * time.Hour).Truncate(time.Second)
-		newer := time.Now().Truncate(time.Second)
-		if err := s.RecordMFA(user, older); err != nil {
-			t.Fatalf("RecordMFA(older): %v", err)
+		fp := uniqueKey("fp")
+		if err := s.BindKey(fp, keyBinding{UserID: "u1", PublicKey: "k"}, time.Now().Add(-time.Second)); err != nil {
+			t.Fatalf("BindKey: %v", err)
 		}
-		if err := s.RecordMFA(user, newer); err != nil {
-			t.Fatalf("RecordMFA(newer): %v", err)
-		}
-		got, _, err := s.LastMFA(user)
-		if err != nil {
-			t.Fatalf("LastMFA: %v", err)
-		}
-		if !got.Equal(newer) {
-			// Re-verifying has to reset the clock, or the 10-day interval
-			// would be measured from a user's very first verification.
-			t.Fatalf("LastMFA = %v, want the later timestamp %v", got, newer)
-		}
-	})
-
-	t.Run("users do not share state", func(t *testing.T) {
-		s := newStore(t)
-		alice, bob := uniqueKey("alice"), uniqueKey("bob")
-		if err := s.RecordMFA(alice, time.Now()); err != nil {
-			t.Fatalf("RecordMFA: %v", err)
-		}
-		if _, ok, err := s.LastMFA(bob); err != nil || ok {
-			t.Fatalf("bob inherited alice's MFA: ok=%v err=%v", ok, err)
+		// This is what sends a user back to the browser every interval.
+		if _, ok, err := s.BoundKey(fp); err != nil || ok {
+			t.Fatalf("expired binding still returned: ok=%v err=%v", ok, err)
 		}
 	})
 }
@@ -183,16 +152,16 @@ func testRedisAddr(t *testing.T) string {
 func newTestRedisStore(t *testing.T) *redisStateStore {
 	t.Helper()
 	addr := testRedisAddr(t)
-	store, err := newRedisStateStore(RedisConfig{Addr: addr, DB: testRedisDB}, 10*24*time.Hour)
+	store, err := newRedisStateStore(RedisConfig{Addr: addr, DB: testRedisDB})
 	if err != nil {
 		t.Fatalf("connect to redis at %s: %v", addr, err)
 	}
 	t.Cleanup(func() {
-		// MFA keys carry a ten-day TTL, so without this every run leaves
-		// litter in the developer's Redis for a week and a half. Scoped to
+		// Bindings carry an hour's TTL here, so without this every run leaves
+		// litter in the developer's Redis. Scoped to
 		// uniqueKey's "test-" prefix rather than FLUSHDB, which would take
 		// out anything else living in this database.
-		deleteTestKeys(t, store, nonceKeyPrefix+"test-*", mfaKeyPrefix+"test-*")
+		deleteTestKeys(t, store, nonceKeyPrefix+"test-*", keyKeyPrefix+"test-*")
 		_ = store.Close()
 	})
 	return store
@@ -224,14 +193,14 @@ func TestRedisStateStore(t *testing.T) {
 func TestRedisStateStoreRefusesBadAddress(t *testing.T) {
 	t.Parallel()
 	// Port 1 on loopback refuses immediately rather than hanging.
-	if _, err := newRedisStateStore(RedisConfig{Addr: "127.0.0.1:1"}, time.Hour); err == nil {
+	if _, err := newRedisStateStore(RedisConfig{Addr: "127.0.0.1:1"}); err == nil {
 		t.Fatal("newRedisStateStore accepted an address nothing is listening on")
 	}
 }
 
-// TestRedisStateStoreSetsTTLs proves both keys expire on their own. Without
-// it Redis would accumulate one nonce per request forever, and MFA keys would
-// outlive every interval.
+// TestRedisStateStoreSetsTTLs proves both kinds of key expire on their own.
+// Without it Redis would accumulate one nonce per request forever, and a
+// binding would never send anyone back to sign in.
 func TestRedisStateStoreSetsTTLs(t *testing.T) {
 	store := newTestRedisStore(t)
 	ctx := context.Background()
@@ -248,33 +217,30 @@ func TestRedisStateStoreSetsTTLs(t *testing.T) {
 		t.Errorf("nonce TTL = %v, want between 0 and %v", ttl, nonceWindow)
 	}
 
-	user := uniqueKey("alice")
-	if err := store.RecordMFA(user, time.Now()); err != nil {
-		t.Fatalf("RecordMFA: %v", err)
+	fp := uniqueKey("fp")
+	if err := store.BindKey(fp, keyBinding{UserID: "u1", PublicKey: "k"}, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("BindKey: %v", err)
 	}
-	ttl, err = store.rdb.TTL(ctx, mfaKeyPrefix+user).Result()
+	ttl, err = store.rdb.TTL(ctx, keyKeyPrefix+fp).Result()
 	if err != nil {
 		t.Fatalf("TTL: %v", err)
 	}
-	if ttl <= 0 || ttl > store.mfaTTL {
-		t.Errorf("mfa TTL = %v, want between 0 and %v", ttl, store.mfaTTL)
+	if ttl <= 0 || ttl > time.Hour {
+		t.Errorf("binding TTL = %v, want between 0 and 1h", ttl)
 	}
 }
 
-// TestRedisStateStoreRejectsCorruptTimestamp: the store shares an
-// unauthenticated Redis, so anything could write over an MFA key. Reading a
-// non-timestamp back must be an error, not a silent "never verified" that
-// re-prompts forever with no explanation.
-func TestRedisStateStoreRejectsCorruptTimestamp(t *testing.T) {
+// TestRedisStateStoreRejectsCorruptBinding: the store shares an
+// unauthenticated Redis, so anything could write over a binding. Reading
+// garbage back must be an error, not a silent "not signed in" that re-prompts
+// forever with no explanation.
+func TestRedisStateStoreRejectsCorruptBinding(t *testing.T) {
 	store := newTestRedisStore(t)
-	user := uniqueKey("garbled")
-	if err := store.rdb.Set(context.Background(), mfaKeyPrefix+user, "not-a-timestamp", time.Minute).Err(); err != nil {
+	fp := uniqueKey("garbled")
+	if err := store.rdb.Set(context.Background(), keyKeyPrefix+fp, "not-json", time.Minute).Err(); err != nil {
 		t.Fatalf("seed key: %v", err)
 	}
-	_, _, err := store.LastMFA(user)
-	if err == nil {
-		t.Fatal("LastMFA accepted a value that isn't a unix timestamp")
-	}
+	_, _, err := store.BoundKey(fp)
 	if !errors.Is(err, errStateUnavailable) {
 		t.Errorf("error = %v, want it to wrap errStateUnavailable so authorize answers 503", err)
 	}
@@ -287,7 +253,7 @@ func TestRedisStateStoreErrorsAfterClose(t *testing.T) {
 	// Built directly rather than via newTestRedisStore: closing the client out
 	// from under that helper's cleanup would only make it log failures at a
 	// point where nothing was written and nothing needs cleaning.
-	store, err := newRedisStateStore(RedisConfig{Addr: testRedisAddr(t), DB: testRedisDB}, time.Hour)
+	store, err := newRedisStateStore(RedisConfig{Addr: testRedisAddr(t), DB: testRedisDB})
 	if err != nil {
 		t.Fatalf("connect to redis: %v", err)
 	}
@@ -297,11 +263,11 @@ func TestRedisStateStoreErrorsAfterClose(t *testing.T) {
 	if _, err := store.SeenNonce(uniqueKey("nonce")); !errors.Is(err, errStateUnavailable) {
 		t.Errorf("SeenNonce error = %v, want errStateUnavailable", err)
 	}
-	if _, _, err := store.LastMFA(uniqueKey("alice")); !errors.Is(err, errStateUnavailable) {
-		t.Errorf("LastMFA error = %v, want errStateUnavailable", err)
+	if _, _, err := store.BoundKey(uniqueKey("fp")); !errors.Is(err, errStateUnavailable) {
+		t.Errorf("BoundKey error = %v, want errStateUnavailable", err)
 	}
-	if err := store.RecordMFA(uniqueKey("alice"), time.Now()); !errors.Is(err, errStateUnavailable) {
-		t.Errorf("RecordMFA error = %v, want errStateUnavailable", err)
+	if err := store.BindKey(uniqueKey("fp"), keyBinding{UserID: "u1", PublicKey: "k"}, time.Now().Add(time.Hour)); !errors.Is(err, errStateUnavailable) {
+		t.Errorf("BindKey error = %v, want errStateUnavailable", err)
 	}
 }
 

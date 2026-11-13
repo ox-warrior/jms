@@ -1,20 +1,20 @@
 package sshclient
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
 
 	"golang.org/x/crypto/ssh"
 )
 
-// candidateKeyNames are the keys tried, in order, when no --identity is given.
-var candidateKeyNames = []string{"id_rsa", "id_ed25519"}
-
 // LoadIdentity resolves the SSH key this caller is identified by: an explicit
-// path when given, otherwise the first usable key among candidateKeyNames.
+// path when given (a service key, see jmsd's service_keys), otherwise jms's
+// own device key, which a Google sign-in binds to its owner.
 func LoadIdentity(explicit string) (ssh.Signer, string, error) {
 	if explicit != "" {
 		signer, err := loadPrivateKey(explicit)
@@ -23,57 +23,7 @@ func LoadIdentity(explicit string) (ssh.Signer, string, error) {
 		}
 		return signer, explicit, nil
 	}
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return nil, "", err
-	}
-	return loadFirstUsable(filepath.Join(home, ".ssh"))
-}
-
-// loadFirstUsable returns the first key in dir that actually loads.
-//
-// "Usable" is the operative word: every candidate that cannot be loaded --
-// missing, encrypted, malformed -- is passed over, not only the missing ones.
-// Continuing on ErrNotExist alone looked equivalent and wasn't. A
-// passphrase-protected ~/.ssh/id_rsa is very common (plenty are years old and
-// were created with one), and it made jms refuse to start with "encrypted
-// private keys are not supported" while a perfectly good ~/.ssh/id_ed25519
-// sat next to it, never tried. Worse, the error named id_rsa -- so the
-// obvious next move was to go edit or delete a key that was never needed.
-//
-// When nothing loads, the first real failure is reported instead of the
-// generic "no private key found": a key that exists but is unusable is the
-// likelier problem, and its own message already says what to fix.
-func loadFirstUsable(dir string) (ssh.Signer, string, error) {
-	var firstErr error
-	for _, name := range candidateKeyNames {
-		path := filepath.Join(dir, name)
-		signer, loadErr := loadPrivateKey(path)
-		if loadErr == nil {
-			return signer, path, nil
-		}
-		if errors.Is(loadErr, os.ErrNotExist) {
-			continue
-		}
-		if firstErr == nil {
-			firstErr = fmt.Errorf("load identity %s: %w", path, loadErr)
-		}
-	}
-	if firstErr != nil {
-		return nil, "", firstErr
-	}
-	return nil, "", fmt.Errorf("no private key found; tried %s", candidateList())
-}
-
-// candidateList renders the candidate names for the not-found message as
-// ~/.ssh/<name>: that message is advice about which file to create, and the
-// tilde form is how anyone would write it.
-func candidateList() string {
-	paths := make([]string, 0, len(candidateKeyNames))
-	for _, name := range candidateKeyNames {
-		paths = append(paths, "~/.ssh/"+name)
-	}
-	return strings.Join(paths, " then ")
+	return deviceKey()
 }
 
 func loadPrivateKey(path string) (ssh.Signer, error) {
@@ -87,4 +37,53 @@ func loadPrivateKey(path string) (ssh.Signer, error) {
 		return nil, errors.New("encrypted private keys are not supported yet")
 	}
 	return signer, err
+}
+
+// deviceKey loads jms's own key, creating it on first use. Nobody registers
+// it anywhere: a Google sign-in binds it to its owner on jmsd, and that
+// binding is the only thing that makes it worth anything. One per machine,
+// so losing a laptop costs that laptop's binding and nothing else.
+func deviceKey() (ssh.Signer, string, error) {
+	dir, err := os.UserConfigDir()
+	if err != nil {
+		return nil, "", err
+	}
+	path := filepath.Join(dir, "jms", "device_key")
+	signer, err := loadPrivateKey(path)
+	if !errors.Is(err, os.ErrNotExist) {
+		if err != nil {
+			return nil, "", fmt.Errorf("load device key %s: %w", path, err)
+		}
+		return signer, path, nil
+	}
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		return nil, "", err
+	}
+	block, err := ssh.MarshalPrivateKey(priv, "jms device key")
+	if err != nil {
+		return nil, "", err
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return nil, "", err
+	}
+	// O_EXCL: two jms processes starting together must not each write a key
+	// and leave one of them signing with a key that is no longer on disk.
+	f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if errors.Is(err, os.ErrExist) {
+		return deviceKey()
+	}
+	if err != nil {
+		return nil, "", err
+	}
+	if err := pem.Encode(f, block); err != nil {
+		f.Close()
+		os.Remove(path)
+		return nil, "", err
+	}
+	if err := f.Close(); err != nil {
+		return nil, "", err
+	}
+	signer, err = ssh.NewSignerFromKey(priv)
+	return signer, path, err
 }

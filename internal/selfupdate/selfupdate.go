@@ -1,5 +1,5 @@
-// Package selfupdate offers the newest published jms at launch and replaces
-// the running binary when the user accepts.
+// Package selfupdate finds the newest published jms at launch and replaces
+// the running binary with it.
 //
 // It exists because nothing in this story is a package manager. jms is
 // installed by curling a binary out of a CDN (scripts/install.sh), so a laptop
@@ -14,11 +14,9 @@
 // comparison stays where it is, as the TUI's passive header notice
 // (tui.updateNotice); this is a separate signal with a separate source.
 //
-// Every failure in this package is silent: no network, no manifest, an
-// unparseable version, a platform with no published build, an install
-// directory this user cannot write. An updater that nags or blocks is one
-// people learn to work around, and the cost of staying quiet is only that the
-// user keeps the build they already had.
+// A failure to *find* a release is silent (no network, no manifest, an
+// unparseable version, an unpublished platform): the caller starts anyway. A
+// failure to *install* one is the caller's to report -- see cli.forceUpdate.
 package selfupdate
 
 import (
